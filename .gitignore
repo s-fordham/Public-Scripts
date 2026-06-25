@@ -1,0 +1,17 @@
+# Generated reports and exports
+*.csv
+*.xlsx
+*.xls
+*.log
+*.txt
+
+# Local PowerShell/editor files
+*.ps1xml
+*.psd1.local
+*.psm1.local
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
