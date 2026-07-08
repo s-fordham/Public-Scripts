@@ -23,6 +23,7 @@ param(
     [string]$CsvCompanyColumn = "Company",
     [string]$CsvDepartmentColumn = "Department",
     [string]$CsvManagerEmailColumn = "PrimaryWorkEmail_Manager",
+    [string]$CsvManagerReferenceColumn = "ManagerReference",
     [string]$CsvStreetAddressColumn = "StreetAddress",
     [string]$CsvCityColumn = "City",
     [string]$CsvCountryNameColumn = "Country",
@@ -55,6 +56,8 @@ function Normalize-Text { param([object]$Value) if ($null -eq $Value) { return "
 function Remove-SmtpPrefix { param([object]$Value) if ($null -eq $Value) { return "" }; return (($Value.ToString()) -replace "^smtp:", "" -replace "^SMTP:", "") }
 function Escape-Ldap { param([string]$Value) if ($null -eq $Value) { return "" }; $v=$Value; $v=$v -replace "\\","\5c"; $v=$v -replace "\*","\2a"; $v=$v -replace "\(","\28"; $v=$v -replace "\)","\29"; $v=$v -replace "`0","\00"; return $v }
 function Get-CsvValue { param([object]$Row,[string]$ColumnName) if ($Row.PSObject.Properties.Name -contains $ColumnName) { return $Row.PSObject.Properties[$ColumnName].Value }; $reportColumnName="HR_$ColumnName"; if ($Row.PSObject.Properties.Name -contains $reportColumnName) { return $Row.PSObject.Properties[$reportColumnName].Value }; return $null }
+function Get-HrLastNameValue { param([object]$Row) $preferredLastName=Get-CsvValue $Row $CsvLastNameColumn; if(-not [string]::IsNullOrWhiteSpace(([string]$preferredLastName))){return $preferredLastName}; return (Get-CsvValue $Row "LastName") }
+function Get-HrLastNameSource { param([object]$Row) $preferredLastName=Get-CsvValue $Row $CsvLastNameColumn; if(-not [string]::IsNullOrWhiteSpace(([string]$preferredLastName))){return $CsvLastNameColumn}; $lastName=Get-CsvValue $Row "LastName"; if(-not [string]::IsNullOrWhiteSpace(([string]$lastName))){return "LastName"}; return "" }
 function Get-ObjectValue { param([object]$Object,[string]$Name) if($null -eq $Object -or $Object.PSObject.Properties.Name -notcontains $Name){return $null}; return $Object.PSObject.Properties[$Name].Value }
 function Get-ParentDn { param([string]$Dn) if ([string]::IsNullOrWhiteSpace($Dn)) { return "" }; $p=$Dn -split ",",2; if ($p.Count -lt 2) { return "" }; return $p[1] }
 function Get-CnFromDistinguishedName { param([string]$Dn) if([string]::IsNullOrWhiteSpace($Dn)){return ""}; if($Dn -match "^CN=([^,]+)"){return (($Matches[1] -replace "\\, ",", ") -replace "\\,",",")}; return "" }
@@ -454,12 +457,13 @@ function Format-PotentialMatchSummary {
 
 function New-Row {
     param([object]$HrRow,[object]$Object,[string]$MatchStatus,[string]$MatchedBy,[bool]$UpdateEligible,[string]$Action,[string]$ActionResult,[string]$Notes,[int]$CsvRow,[int]$PotentialMatchCount=0,[string]$PotentialMatches="")
-    $hrEmail=Get-CsvValue $HrRow $CsvEmailColumn; $hrFirst=Get-CsvValue $HrRow $CsvFirstNameColumn; $hrLast=Get-CsvValue $HrRow $CsvLastNameColumn; $hrTitle=Get-CsvValue $HrRow $CsvJobTitleColumn; $hrEmp=Get-CsvValue $HrRow $CsvEmployeeIdColumn
+    $hrEmail=Get-CsvValue $HrRow $CsvEmailColumn; $hrFirst=Get-CsvValue $HrRow $CsvFirstNameColumn; $hrLast=Get-HrLastNameValue $HrRow; $hrLastSource=Get-HrLastNameSource $HrRow; $hrTitle=Get-CsvValue $HrRow $CsvJobTitleColumn; $hrEmp=Get-CsvValue $HrRow $CsvEmployeeIdColumn
     $reviewDecision=Get-CsvValue $HrRow $CsvReviewDecisionColumn; $approvedDn=Get-CsvValue $HrRow $CsvApprovedADDistinguishedNameColumn; $approvedBy=Get-CsvValue $HrRow $CsvApprovedByColumn; $approvalNotes=Get-CsvValue $HrRow $CsvApprovalNotesColumn
     $type=if($Object){Get-RecipientType $Object}else{""}
     $row=[ordered]@{}
     $row["CsvRow"]=$CsvRow
     $row["HR_$CsvEmployeeIdColumn"]=$hrEmp; $row["HR_$CsvEmailColumn"]=$hrEmail; $row["HR_$CsvFirstNameColumn"]=$hrFirst; $row["HR_$CsvLastNameColumn"]=$hrLast; $row["HR_$CsvJobTitleColumn"]=$hrTitle
+    $row["HR_LastNameSource"]=$hrLastSource
     $row["MatchStatus"]=$MatchStatus; $row["MatchedBy"]=$MatchedBy; $row["UpdateEligible"]=$UpdateEligible; $row["EmployeeIDNeedsUpdate"] = if($Object){(Normalize-Text (Get-ObjectValue $Object "employeeID")) -ne (Normalize-Text $hrEmp)}else{$false}
     $row["Action"]=$Action; $row["ActionResult"]=$ActionResult; $row["Notes"]=$Notes
     $row["ReviewDecision"]=$reviewDecision; $row["ApprovedADDistinguishedName"]=$approvedDn; $row["ApprovedBy"]=$approvedBy; $row["ApprovalNotes"]=$approvalNotes
@@ -503,33 +507,189 @@ function Add-MailRecipientFallback {
     $Results.Add((New-Row $HrRow $null "Ambiguous - Multiple MailRecipient Name Matches" "MailRecipient FirstName + LastName" $false "No action" "Skipped" "Multiple MailContacts/MailUsers matched first name and last name. Manual review required." $CsvRow)); return $true
 }
 
+function Resolve-ManagerReferenceToADUser {
+    param([object]$ManagerReference,[object[]]$HrRows,[string]$SearchBase)
+    $reference=([string]$ManagerReference).Trim()
+    if([string]::IsNullOrWhiteSpace($reference)){
+        return [pscustomobject]@{Resolved=$true; DistinguishedName=""; Status="No manager reference supplied."; MatchCount=0}
+    }
+
+    $employeeIdMatches=@(Find-ADUserByEmployeeId $reference $SearchBase)
+    if($employeeIdMatches.Count -eq 1){
+        return [pscustomobject]@{Resolved=$true; DistinguishedName=(Get-ObjectValue $employeeIdMatches[0] "DistinguishedName"); Status="Resolved ManagerReference to AD user by employeeID."; MatchCount=1}
+    }
+    if($employeeIdMatches.Count -gt 1){
+        return [pscustomobject]@{Resolved=$false; DistinguishedName=""; Status="ManagerReference matched multiple AD users by employeeID."; MatchCount=$employeeIdMatches.Count}
+    }
+
+    $managerRows=@($HrRows | Where-Object { (Normalize-Text (Get-CsvValue $_ $CsvEmployeeIdColumn)) -eq (Normalize-Text $reference) })
+    if($managerRows.Count -eq 0){
+        return [pscustomobject]@{Resolved=$false; DistinguishedName=""; Status="ManagerReference did not match an AD employeeID or a WorkerID row in the HR CSV."; MatchCount=0}
+    }
+    if($managerRows.Count -gt 1){
+        return [pscustomobject]@{Resolved=$false; DistinguishedName=""; Status="ManagerReference matched multiple WorkerID rows in the HR CSV."; MatchCount=$managerRows.Count}
+    }
+
+    $managerRow=$managerRows[0]
+    $managerEmail=([string](Get-CsvValue $managerRow $CsvEmailColumn)).Trim()
+    $managerFirst=([string](Get-CsvValue $managerRow $CsvFirstNameColumn)).Trim()
+    $managerLast=([string](Get-HrLastNameValue $managerRow)).Trim()
+    $managerTitle=([string](Get-CsvValue $managerRow $CsvJobTitleColumn)).Trim()
+
+    if(-not [string]::IsNullOrWhiteSpace($managerEmail)){
+        $emailMatches=@(Find-ADUserByEmail $managerEmail $SearchBase)
+        if($emailMatches.Count -eq 1){
+            return [pscustomobject]@{Resolved=$true; DistinguishedName=(Get-ObjectValue $emailMatches[0] "DistinguishedName"); Status="Resolved ManagerReference through manager HR row email."; MatchCount=1}
+        }
+        if($emailMatches.Count -gt 1){
+            return [pscustomobject]@{Resolved=$false; DistinguishedName=""; Status="Manager HR row email matched multiple AD users."; MatchCount=$emailMatches.Count}
+        }
+    }
+
+    $nameMatches=@(Find-ADUserByName $managerFirst $managerLast $SearchBase)
+    $titleMatches=@($nameMatches | Where-Object { (Normalize-Text (Get-ObjectValue $_ "title")) -eq (Normalize-Text $managerTitle) })
+    if($titleMatches.Count -eq 1){
+        return [pscustomobject]@{Resolved=$true; DistinguishedName=(Get-ObjectValue $titleMatches[0] "DistinguishedName"); Status="Resolved ManagerReference through manager HR row name and title."; MatchCount=1}
+    }
+    if($titleMatches.Count -gt 1){
+        return [pscustomobject]@{Resolved=$false; DistinguishedName=""; Status="Manager HR row name and title matched multiple AD users."; MatchCount=$titleMatches.Count}
+    }
+
+    return [pscustomobject]@{Resolved=$false; DistinguishedName=""; Status="ManagerReference matched an HR row, but that manager row did not resolve to a single AD user."; MatchCount=0}
+}
+
 function New-MismatchRows {
-    param([int]$CsvRow,[object]$HrRow,[object]$User,[array]$Map)
+    param([int]$CsvRow,[object]$HrRow,[object]$User,[array]$Map,[object[]]$HrRows,[string]$SearchBase,[string]$MatchedBy,[string]$MatchStatus,[bool]$EmployeeIDAlreadyPresent,[string]$EmployeeIDActionGuidance)
     $rows=New-Object System.Collections.Generic.List[object]
     foreach($m in $Map){
         if(-not $m.Compare){continue}
-        if(($HrRow.PSObject.Properties.Name -notcontains $m.CsvColumn) -and ($HrRow.PSObject.Properties.Name -notcontains "HR_$($m.CsvColumn)")){continue}
-        $hr=Get-CsvValue $HrRow $m.CsvColumn
-        $ad=if($m.CompareMode -eq "Email"){(@(Get-ObjectEmailAddresses $User) -join "; ")}elseif($m.CompareMode -eq "ParentOU"){Get-ParentDn (Get-ObjectValue $User "DistinguishedName")}elseif($m.CompareMode -eq "ManagerEmailToDN"){Get-ObjectValue $User "manager"}else{Get-ObjectValue $User $m.ADAttribute}
-        $isMatch=if($m.CompareMode -eq "Email"){Test-ObjectEmailMatches $User $hr}else{(Normalize-Text $hr) -eq (Normalize-Text $ad)}
+        if($m.CsvColumn -eq $CsvLastNameColumn){
+            $hr=Get-HrLastNameValue $HrRow
+            if([string]::IsNullOrWhiteSpace(([string]$hr).Trim())){continue}
+        }else{
+            if(($HrRow.PSObject.Properties.Name -notcontains $m.CsvColumn) -and ($HrRow.PSObject.Properties.Name -notcontains "HR_$($m.CsvColumn)")){continue}
+            $hr=Get-CsvValue $HrRow $m.CsvColumn
+        }
+        $managerResolution=$null
+        if($m.CompareMode -eq "ManagerReferenceToDN"){
+            $managerResolution=Resolve-ManagerReferenceToADUser -ManagerReference $hr -HrRows $HrRows -SearchBase $SearchBase
+            $ad=Get-ObjectValue $User "manager"
+            $proposed=$managerResolution.DistinguishedName
+            $isMatch=if([string]::IsNullOrWhiteSpace(([string]$hr).Trim())){[string]::IsNullOrWhiteSpace(([string]$ad).Trim())}elseif($managerResolution.Resolved){(Normalize-Text $proposed) -eq (Normalize-Text $ad)}else{$false}
+        }else{
+            $ad=if($m.CompareMode -eq "Email"){(@(Get-ObjectEmailAddresses $User) -join "; ")}elseif($m.CompareMode -eq "ParentOU"){Get-ParentDn (Get-ObjectValue $User "DistinguishedName")}elseif($m.CompareMode -eq "ManagerEmailToDN"){Get-ObjectValue $User "manager"}else{Get-ObjectValue $User $m.ADAttribute}
+            $proposed=$hr
+            $isMatch=if($m.CompareMode -eq "Email"){Test-ObjectEmailMatches $User $hr}else{(Normalize-Text $hr) -eq (Normalize-Text $ad)}
+        }
         if(-not $isMatch){
+            $mismatchType=if($m.CompareMode -eq "ManagerReferenceToDN" -and $managerResolution -and -not $managerResolution.Resolved){"Manager reference unresolved"}else{"Value differs"}
+            $whatWillChange=if($m.CompareMode -eq "ManagerReferenceToDN" -and $managerResolution -and -not $managerResolution.Resolved){"ManagerReference '$hr' could not be resolved to exactly one AD manager DN. Review before provisioning updates AD manager."}else{"AD $($m.ADAttribute) would change from '$ad' to '$proposed'."}
             $rows.Add([pscustomobject]@{
                 CsvRow=$CsvRow
                 HR_WorkerID=(Get-CsvValue $HrRow $CsvEmployeeIdColumn)
+                HR_FirstName=(Get-CsvValue $HrRow $CsvFirstNameColumn)
+                HR_LastName=(Get-HrLastNameValue $HrRow)
+                HR_LastNameSource=(Get-HrLastNameSource $HrRow)
+                HR_BusinessTitle=(Get-CsvValue $HrRow $CsvJobTitleColumn)
+                HR_Department=(Get-CsvValue $HrRow $CsvDepartmentColumn)
+                HR_ManagerReference=(Get-CsvValue $HrRow $CsvManagerReferenceColumn)
                 AD_UserPrincipalName=(Get-ObjectValue $User "userPrincipalName")
                 AD_EmployeeID_Current=(Get-ObjectValue $User "employeeID")
                 AD_SamAccountName=(Get-ObjectValue $User "sAMAccountName")
+                AD_GivenName=(Get-ObjectValue $User "givenName")
+                AD_Surname=(Get-ObjectValue $User "sn")
+                AD_JobTitle=(Get-ObjectValue $User "title")
+                AD_Department=(Get-ObjectValue $User "department")
+                AD_ManagerDN=(Get-ObjectValue $User "manager")
+                ProposedManagerResolution=if($managerResolution){$managerResolution.Status}else{""}
+                MatchedBy=$MatchedBy
+                MatchStatus=$MatchStatus
+                EmployeeIDAlreadyPresent=$EmployeeIDAlreadyPresent
+                EmployeeIDActionGuidance=$EmployeeIDActionGuidance
                 WorkdayAttribute=$m.WorkdayAttribute
                 CsvColumn=$m.CsvColumn
                 ADAttribute=$m.ADAttribute
                 MappingType=$m.MappingType
                 CurrentADValue=$ad
-                ProposedHRValue=$hr
-                WhatWillChange="AD $($m.ADAttribute) would change from '$ad' to '$hr'."
-                MismatchType="Value differs"
+                ProposedHRValue=$proposed
+                WhatWillChange=$whatWillChange
+                MismatchType=$mismatchType
                 ProvisioningImpact="Potential AD change when Entra Workday provisioning updates this attribute."
             })
         }
+    }
+    return $rows
+}
+
+function New-EmptyMismatchReportRow {
+    [pscustomobject]@{
+        CsvRow=$null
+        HR_WorkerID=$null
+        HR_FirstName=$null
+        HR_LastName=$null
+        HR_LastNameSource=$null
+        HR_BusinessTitle=$null
+        HR_Department=$null
+        HR_ManagerReference=$null
+        AD_UserPrincipalName=$null
+        AD_EmployeeID_Current=$null
+        AD_SamAccountName=$null
+        AD_GivenName=$null
+        AD_Surname=$null
+        AD_JobTitle=$null
+        AD_Department=$null
+        AD_ManagerDN=$null
+        ProposedManagerResolution=$null
+        MatchedBy=$null
+        MatchStatus=$null
+        EmployeeIDAlreadyPresent=$null
+        EmployeeIDActionGuidance=$null
+        WorkdayAttribute=$null
+        CsvColumn=$null
+        ADAttribute=$null
+        MappingType=$null
+        CurrentADValue=$null
+        ProposedHRValue=$null
+        WhatWillChange=$null
+        MismatchType=$null
+        ProvisioningImpact=$null
+        Result="No mismatches found."
+    }
+}
+
+function New-EmployeeIdApplyReportRows {
+    param([object[]]$MatchResults)
+    $rows=New-Object System.Collections.Generic.List[object]
+    foreach($result in @($MatchResults)){
+        $workerId=Get-ObjectValue $result "HR_$CsvEmployeeIdColumn"
+        $currentEmployeeId=Get-ObjectValue $result "AD_EmployeeID_Current"
+        $actionResult=Get-ObjectValue $result "ActionResult"
+        $hasEmployeeId=($actionResult -eq "Updated" -or $actionResult -eq "Already correct")
+        $outcome=if($actionResult -eq "Updated"){"Updated EmployeeID"}elseif($actionResult -eq "Already correct"){"Already had EmployeeID"}else{"Skipped"}
+        $employeeIdAfter=if($hasEmployeeId){$workerId}else{$currentEmployeeId}
+        $rows.Add([pscustomobject]@{
+            CsvRow=(Get-ObjectValue $result "CsvRow")
+            ApplyOutcome=$outcome
+            Action=(Get-ObjectValue $result "Action")
+            ActionResult=$actionResult
+            EmployeeIDNowPresent=$hasEmployeeId
+            EmployeeIDBefore=$currentEmployeeId
+            EmployeeIDAfter=$employeeIdAfter
+            HR_WorkerID=$workerId
+            HR_FirstName=(Get-ObjectValue $result "HR_$CsvFirstNameColumn")
+            HR_LastName=(Get-ObjectValue $result "HR_$CsvLastNameColumn")
+            HR_LastNameSource=(Get-ObjectValue $result "HR_LastNameSource")
+            HR_BusinessTitle=(Get-ObjectValue $result "HR_$CsvJobTitleColumn")
+            MatchStatus=(Get-ObjectValue $result "MatchStatus")
+            MatchedBy=(Get-ObjectValue $result "MatchedBy")
+            UpdateEligible=(Get-ObjectValue $result "UpdateEligible")
+            AD_ObjectType=(Get-ObjectValue $result "AD_ObjectType")
+            AD_SamAccountName=(Get-ObjectValue $result "AD_SamAccountName")
+            AD_UserPrincipalName=(Get-ObjectValue $result "AD_UserPrincipalName")
+            AD_DistinguishedName=(Get-ObjectValue $result "AD_DistinguishedName")
+            SkippedReason=if($outcome -eq "Skipped"){Get-ObjectValue $result "Notes"}else{""}
+            Notes=(Get-ObjectValue $result "Notes")
+        })
     }
     return $rows
 }
@@ -538,28 +698,36 @@ Write-Host "Importing HR CSV: $CsvPath"
 Import-Module ActiveDirectory -ErrorAction Stop
 if(-not(Test-Path $CsvPath)){throw "CSV path not found: $CsvPath"}
 $hrRows=@(Import-Csv $CsvPath)
-$required=@($CsvEmailColumn,$CsvFirstNameColumn,$CsvLastNameColumn,$CsvJobTitleColumn,$CsvEmployeeIdColumn)
+$required=@($CsvEmailColumn,$CsvFirstNameColumn,$CsvJobTitleColumn,$CsvEmployeeIdColumn)
 $cols=@($hrRows[0].PSObject.Properties.Name)
 foreach($c in $required){if(($cols -notcontains $c) -and ($cols -notcontains "HR_$c")){throw "Required CSV column not found: '$c' or 'HR_$c'. Available columns: $($cols -join ', ')"}}
+if(($cols -notcontains $CsvLastNameColumn) -and ($cols -notcontains "HR_$CsvLastNameColumn") -and ($cols -notcontains "LastName") -and ($cols -notcontains "HR_LastName")){throw "Required CSV last-name column not found: '$CsvLastNameColumn', 'HR_$CsvLastNameColumn', 'LastName', or 'HR_LastName'. Available columns: $($cols -join ', ')"}
 
 $map=@(
     [pscustomobject]@{WorkdayAttribute="FirstName";CsvColumn=$CsvFirstNameColumn;ADAttribute="givenName";MappingType="Create + update";CompareMode="Direct";Compare=$true},
     [pscustomobject]@{WorkdayAttribute="PreferredLastName";CsvColumn=$CsvLastNameColumn;ADAttribute="sn";MappingType="Create + update";CompareMode="Direct";Compare=$true},
-    [pscustomobject]@{WorkdayAttribute="PrimaryWorkEmail";CsvColumn=$CsvEmailColumn;ADAttribute="mail/proxyAddresses/targetAddress";MappingType="Create + update";CompareMode="Email";Compare=$true},
+    [pscustomobject]@{WorkdayAttribute="PrimaryWorkEmail";CsvColumn=$CsvEmailColumn;ADAttribute="mail/proxyAddresses/targetAddress";MappingType="Create only";CompareMode="Email";Compare=$false},
     [pscustomobject]@{WorkdayAttribute="HR Business Title";CsvColumn=$CsvJobTitleColumn;ADAttribute="title";MappingType="Create + update";CompareMode="Direct";Compare=$true},
+    [pscustomobject]@{WorkdayAttribute="Department";CsvColumn=$CsvDepartmentColumn;ADAttribute="department";MappingType="Create + update";CompareMode="Direct";Compare=$true},
+    [pscustomobject]@{WorkdayAttribute="ManagerReference";CsvColumn=$CsvManagerReferenceColumn;ADAttribute="manager";MappingType="Create + update";CompareMode="ManagerReferenceToDN";Compare=$true},
     [pscustomobject]@{WorkdayAttribute="parentDistinguishedName";CsvColumn=$CsvTargetOUColumn;ADAttribute="distinguishedName";MappingType="Create + update";CompareMode="ParentOU";Compare=$false}
 )
 
 $results=New-Object System.Collections.Generic.List[object]
 $mismatches=New-Object System.Collections.Generic.List[object]
+$systemMismatchMatchSources=New-Object System.Collections.Generic.List[object]
 $reservedExactAdUserDns=@{}
 $confirmedAdUserDns=@{}
 $approvedReviewDnUseCounts=@{}
 $approvedReviewDnUseRows=@{}
 
 $approvedScanRowNum=1
+$approvedScanTotalRows=[Math]::Max($hrRows.Count,1)
 foreach($r in $hrRows){
     $approvedScanRowNum++
+    $approvedScanCurrentRow=$approvedScanRowNum-1
+    $approvedScanPercentComplete=[Math]::Min(100,[Math]::Round((($approvedScanCurrentRow / $approvedScanTotalRows)*100),0))
+    Write-Progress -Activity "Scanning approved review decisions" -Status "$approvedScanPercentComplete% complete - Row $approvedScanCurrentRow of $($hrRows.Count) (CSV row ${approvedScanRowNum})" -PercentComplete $approvedScanPercentComplete
     $reviewDecision=Get-CsvValue $r $CsvReviewDecisionColumn
     $approvedDn=Get-CsvValue $r $CsvApprovedADDistinguishedNameColumn
     if((Normalize-Text $reviewDecision) -ne (Normalize-Text $ApprovedReviewDecision) -or [string]::IsNullOrWhiteSpace($approvedDn)){continue}
@@ -578,6 +746,7 @@ foreach($r in $hrRows){
     $approvedReviewDnUseCounts[$approvedUsageKey]++
     $approvedReviewDnUseRows[$approvedUsageKey].Add($approvedScanRowNum)
 }
+Write-Progress -Activity "Scanning approved review decisions" -Completed
 
 $duplicateApprovedDns=@{}
 foreach($approvedUsageKey in @($approvedReviewDnUseCounts.Keys)){
@@ -586,10 +755,16 @@ foreach($approvedUsageKey in @($approvedReviewDnUseCounts.Keys)){
     }
 }
 
+$reservationScanRowNum=1
+$reservationScanTotalRows=[Math]::Max($hrRows.Count,1)
 foreach($r in $hrRows){
+    $reservationScanRowNum++
+    $reservationScanCurrentRow=$reservationScanRowNum-1
+    $reservationScanPercentComplete=[Math]::Min(100,[Math]::Round((($reservationScanCurrentRow / $reservationScanTotalRows)*100),0))
+    Write-Progress -Activity "Reserving exact AD matches" -Status "$reservationScanPercentComplete% complete - Row $reservationScanCurrentRow of $($hrRows.Count) (CSV row ${reservationScanRowNum})" -PercentComplete $reservationScanPercentComplete
     $email=([string](Get-CsvValue $r $CsvEmailColumn)).Trim()
     $first=([string](Get-CsvValue $r $CsvFirstNameColumn)).Trim()
-    $last=([string](Get-CsvValue $r $CsvLastNameColumn)).Trim()
+    $last=([string](Get-HrLastNameValue $r)).Trim()
     $title=([string](Get-CsvValue $r $CsvJobTitleColumn)).Trim()
     $emp=([string](Get-CsvValue $r $CsvEmployeeIdColumn)).Trim()
     if([string]::IsNullOrWhiteSpace($emp)){continue}
@@ -633,15 +808,17 @@ foreach($r in $hrRows){
         if($reservedDn){$reservedExactAdUserDns[$reservedDn]=$true}
     }
 }
+Write-Progress -Activity "Reserving exact AD matches" -Completed
 
 $rowNum=1
 $totalRows=[Math]::Max($hrRows.Count,1)
+$matchingProgressActivity=if($CheckSystemMismatch){"Matching HR users to AD and checking system mismatches"}else{"Matching HR users to AD"}
 foreach($r in $hrRows){
     $rowNum++
-    $email=([string](Get-CsvValue $r $CsvEmailColumn)).Trim(); $first=([string](Get-CsvValue $r $CsvFirstNameColumn)).Trim(); $last=([string](Get-CsvValue $r $CsvLastNameColumn)).Trim(); $title=([string](Get-CsvValue $r $CsvJobTitleColumn)).Trim(); $emp=([string](Get-CsvValue $r $CsvEmployeeIdColumn)).Trim()
+    $email=([string](Get-CsvValue $r $CsvEmailColumn)).Trim(); $first=([string](Get-CsvValue $r $CsvFirstNameColumn)).Trim(); $last=([string](Get-HrLastNameValue $r)).Trim(); $title=([string](Get-CsvValue $r $CsvJobTitleColumn)).Trim(); $emp=([string](Get-CsvValue $r $CsvEmployeeIdColumn)).Trim()
     $currentRow=$rowNum-1
     $percentComplete=[Math]::Min(100,[Math]::Round((($currentRow / $totalRows)*100),0))
-    Write-Progress -Activity "Matching HR users to AD" -Status "$percentComplete% complete - Row $currentRow of $($hrRows.Count) (CSV row ${rowNum}): $email" -PercentComplete $percentComplete
+    Write-Progress -Activity $matchingProgressActivity -Status "$percentComplete% complete - Row $currentRow of $($hrRows.Count) (CSV row ${rowNum}): $email" -PercentComplete $percentComplete
     $reviewDecision=Get-CsvValue $r $CsvReviewDecisionColumn
     if((Normalize-Text $reviewDecision) -eq (Normalize-Text $IgnoredReviewDecision)){
         $results.Add((New-Row $r $null "Ignored - ReviewDecision" "ReviewDecision" $false "No action" "Skipped" "ReviewDecision is Ignore. No matching or employeeID update is attempted for this row." $rowNum))
@@ -727,12 +904,30 @@ foreach($r in $hrRows){
         elseif($nameMatches.Count -eq 1){$user=$nameMatches[0];$status="Potential Match - Title Mismatch";$by="FirstName + LastName only";$eligible=$false;$notes="Single AD user matched first and last name, but title differs."}
         else{$results.Add((New-Row $r $null "Ambiguous - Multiple Name Matches" "FirstName + LastName" $false "No action" "Skipped" "Multiple AD users matched name but no single title match." $rowNum));continue}
     }
-    if($CheckSystemMismatch -and $user){ foreach($mm in @(New-MismatchRows $rowNum $r $user $map)){ $mismatches.Add($mm) } }
+    if($CheckSystemMismatch -and $user){
+        $employeeIdAlreadyPresent=((Normalize-Text (Get-ObjectValue $user "employeeID")) -eq (Normalize-Text $emp))
+        $matchedByWorkerId=($by -eq "WorkerID + AD employeeID")
+        $employeeIdGuidance=if($matchedByWorkerId){"No further EmployeeID action needed - matched by WorkerID already present in AD employeeID."}elseif($employeeIdAlreadyPresent){"No further EmployeeID action needed - AD employeeID already matches HR WorkerID."}else{"WorkerID still needs to be applied - system mismatch comparison used a non-WorkerID match."}
+        $systemMismatchMatchSources.Add([pscustomobject]@{
+            CsvRow=$rowNum
+            HR_WorkerID=$emp
+            MatchedBy=$by
+            MatchStatus=$status
+            AD_UserPrincipalName=(Get-ObjectValue $user "userPrincipalName")
+            AD_SamAccountName=(Get-ObjectValue $user "sAMAccountName")
+            AD_EmployeeID_Current=(Get-ObjectValue $user "employeeID")
+            EmployeeIDAlreadyPresent=$employeeIdAlreadyPresent
+            EmployeeIDActionGuidance=$employeeIdGuidance
+        })
+        foreach($mm in @(New-MismatchRows -CsvRow $rowNum -HrRow $r -User $user -Map $map -HrRows $hrRows -SearchBase $SearchBase -MatchedBy $by -MatchStatus $status -EmployeeIDAlreadyPresent $employeeIdAlreadyPresent -EmployeeIDActionGuidance $employeeIdGuidance)){ $mismatches.Add($mm) }
+    }
     $action="No action";$actionResult="Dry run"
     if($user -and $eligible -and (Test-IsADUserObject $user)){
         $matchedDn=Normalize-Text (Get-ObjectValue $user "DistinguishedName")
         if($matchedDn -and $confirmedAdUserDns.ContainsKey($matchedDn)){
-            $results.Add((New-Row $r $user "Duplicate - AD User Already Matched" $by $false "No action" "Skipped" "This AD user was already matched to an earlier CSV row. Review manually before approving or applying any employeeID update." $rowNum))
+            $firstMatch=$confirmedAdUserDns[$matchedDn]
+            $firstMatchDetail=if($firstMatch -and $firstMatch.PSObject.Properties.Name -contains "CsvRow"){" Earlier match: CSV row $($firstMatch.CsvRow), HR WorkerID $($firstMatch.HR_WorkerID), MatchedBy $($firstMatch.MatchedBy)."}else{""}
+            $results.Add((New-Row $r $user "Duplicate - AD User Already Matched" $by $false "No action" "Skipped" "This AD user was already matched to an earlier CSV row.$firstMatchDetail Review manually before approving or applying any employeeID update." $rowNum))
             continue
         }
     }
@@ -744,12 +939,22 @@ foreach($r in $hrRows){
     }
     if($user -and $eligible -and (Test-IsADUserObject $user)){
         $confirmedDn=Normalize-Text (Get-ObjectValue $user "DistinguishedName")
-        if($confirmedDn){$confirmedAdUserDns[$confirmedDn]=$true}
+        if($confirmedDn){
+            $confirmedAdUserDns[$confirmedDn]=[pscustomobject]@{
+                CsvRow=$rowNum
+                HR_WorkerID=$emp
+                MatchedBy=$by
+                AD_UserPrincipalName=(Get-ObjectValue $user "userPrincipalName")
+                AD_SamAccountName=(Get-ObjectValue $user "sAMAccountName")
+            }
+        }
     }
     $results.Add((New-Row $r $user $status $by $eligible $action $actionResult $notes $rowNum))
 }
-Write-Progress -Activity "Matching HR users to AD" -Completed
+Write-Progress -Activity $matchingProgressActivity -Completed
 
+$employeeIdApplyResults=if($Apply){@(New-EmployeeIdApplyReportRows -MatchResults $results)}else{@()}
+$duplicateAdUserMatches=@($results|Where-Object{$_.MatchStatus -eq "Duplicate - AD User Already Matched"})
 $dir=Split-Path $ReportPath -Parent; if($dir -and -not(Test-Path $dir)){New-Item -Path $dir -ItemType Directory -Force | Out-Null}
 if($CheckSystemMismatch -and [string]::IsNullOrWhiteSpace($SystemMismatchReportPath)){
     $reportDirectory=Split-Path $ReportPath -Parent
@@ -765,22 +970,39 @@ if($CheckSystemMismatch){
 }
 $xlsx=Ensure-ImportExcelModule -DoNotInstallMissingModules:$DoNotInstallMissingModules
 if($xlsx){
-    $workerIdTextColumns=@("HR_$CsvEmployeeIdColumn","HR_WorkerID",$CsvEmployeeIdColumn)|Select-Object -Unique
-    $results | Export-ReportWorksheet -Path $ReportPath -WorksheetName "HR AD Match" -TableName "HRADMatch" -NoNumberConversionColumns $workerIdTextColumns
+    $employeeIdTextColumns=@("HR_$CsvEmployeeIdColumn","HR_WorkerID",$CsvEmployeeIdColumn,"AD_EmployeeID_Current","EmployeeIDBefore","EmployeeIDAfter","User_EmployeeID","HR_$CsvManagerReferenceColumn","HR_ManagerReference",$CsvManagerReferenceColumn)|Select-Object -Unique
+    $results | Export-ReportWorksheet -Path $ReportPath -WorksheetName "HR AD Match" -TableName "HRADMatch" -NoNumberConversionColumns $employeeIdTextColumns
+    if($duplicateAdUserMatches.Count -gt 0){
+        $duplicateAdUserMatches | Export-ReportWorksheet -Path $ReportPath -WorksheetName "Duplicate AD User Matches" -TableName "DuplicateADUserMatches" -NoNumberConversionColumns $employeeIdTextColumns
+        Write-Host "Duplicate AD user matches worksheet added to readiness report: $ReportPath" -ForegroundColor Green
+    }
+    if($Apply){
+        $employeeIdApplyResults | Export-ReportWorksheet -Path $ReportPath -WorksheetName "EmployeeID Apply Results" -TableName "EmployeeIDApplyResults" -NoNumberConversionColumns $employeeIdTextColumns
+    }
     Write-Host "Excel report written to: $ReportPath" -ForegroundColor Green
     if($CheckSystemMismatch){
         if($mismatches.Count -gt 0){
-            $mismatches|Export-ReportWorksheet -Path $SystemMismatchReportPath -WorksheetName "System Mismatches" -TableName "SystemMismatches" -NoNumberConversionColumns $workerIdTextColumns
+            $mismatches|Export-ReportWorksheet -Path $SystemMismatchReportPath -WorksheetName "System Mismatches" -TableName "SystemMismatches" -NoNumberConversionColumns $employeeIdTextColumns
         }else{
-            [pscustomobject]@{Result="No mismatches found."}|Export-ReportWorksheet -Path $SystemMismatchReportPath -WorksheetName "System Mismatches" -TableName "SystemMismatches"
+            New-EmptyMismatchReportRow|Export-ReportWorksheet -Path $SystemMismatchReportPath -WorksheetName "System Mismatches" -TableName "SystemMismatches" -NoNumberConversionColumns $employeeIdTextColumns
         }
         Write-Host "System mismatch report written to: $SystemMismatchReportPath" -ForegroundColor Green
     }
 }else{
     $csv=[System.IO.Path]::ChangeExtension($ReportPath,".csv"); $results|Export-Csv $csv -NoTypeInformation -Encoding UTF8; Write-Warning "CSV report written to: $csv"
+    if($duplicateAdUserMatches.Count -gt 0){
+        $duplicateCsv=[System.IO.Path]::ChangeExtension($ReportPath,".Duplicate-AD-User-Matches.csv")
+        $duplicateAdUserMatches|Export-Csv $duplicateCsv -NoTypeInformation -Encoding UTF8
+        Write-Warning "Duplicate AD user matches CSV report written to: $duplicateCsv"
+    }
+    if($Apply){
+        $applyCsv=[System.IO.Path]::ChangeExtension($ReportPath,".EmployeeID-Apply-Results.csv")
+        $employeeIdApplyResults|Export-Csv $applyCsv -NoTypeInformation -Encoding UTF8
+        Write-Warning "EmployeeID apply results CSV report written to: $applyCsv"
+    }
     if($CheckSystemMismatch){
         $mismatchCsv=[System.IO.Path]::ChangeExtension($SystemMismatchReportPath,".csv")
-        if($mismatches.Count -gt 0){$mismatches|Export-Csv $mismatchCsv -NoTypeInformation -Encoding UTF8}else{[pscustomobject]@{Result="No mismatches found."}|Export-Csv $mismatchCsv -NoTypeInformation -Encoding UTF8}
+        if($mismatches.Count -gt 0){$mismatches|Export-Csv $mismatchCsv -NoTypeInformation -Encoding UTF8}else{New-EmptyMismatchReportRow|Export-Csv $mismatchCsv -NoTypeInformation -Encoding UTF8}
         Write-Warning "System mismatch CSV report written to: $mismatchCsv"
     }
 }
@@ -794,5 +1016,13 @@ if($unapprovedResults.Count -gt 0){
     $unapprovedResults|Group-Object MatchStatus|Select-Object Name,Count|Format-Table -AutoSize
 }else{
     Write-Host "No unapproved rows remain." -ForegroundColor Green
+}
+if($CheckSystemMismatch){
+    Write-Host "`nSystem mismatch match source:" -ForegroundColor Cyan
+    if($systemMismatchMatchSources.Count -gt 0){
+        $systemMismatchMatchSources|Group-Object EmployeeIDActionGuidance|Select-Object Name,Count|Format-Table -AutoSize
+    }else{
+        Write-Host "No matched AD users were available for system mismatch comparison." -ForegroundColor Yellow
+    }
 }
 if(-not $Apply){Write-Host "Dry run complete. No AD changes were made." -ForegroundColor Yellow}else{Write-Host "Apply mode complete. Only employeeID updates were attempted against eligible AD users." -ForegroundColor Green}
