@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Default mode is dry-run. AD users are preferred. If no AD user is matched, MailContacts and MailUsers are checked and reported only.
-    The only write action is Set-ADUser -EmployeeID and only when -Apply is specified.
+    Write actions require -Apply. By default, the only write action is Set-ADUser -EmployeeID. Approved MailContacts can also be deleted when -DeleteApprovedMailContacts is supplied.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -46,11 +46,20 @@ param(
     [string]$SearchBase,
     [switch]$Apply,
     [switch]$CheckSystemMismatch,
+    [switch]$CheckMailContactReview,
+    [switch]$ReserveExactMatches,
+    [switch]$ApprovedOnly,
+    [switch]$DeleteApprovedMailContacts,
     [switch]$DoNotInstallMissingModules
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$script:DirectoryObjectCache=@{}
+$script:DirectoryObjectCacheHits=0
+$script:DirectoryObjectCacheMisses=0
+$script:HrRowsByEmployeeId=@{}
+$script:RunStopwatch=[System.Diagnostics.Stopwatch]::StartNew()
 
 function Normalize-Text { param([object]$Value) if ($null -eq $Value) { return "" }; return ($Value.ToString().Trim() -replace "\s+", " ").ToLowerInvariant() }
 function Remove-SmtpPrefix { param([object]$Value) if ($null -eq $Value) { return "" }; return (($Value.ToString()) -replace "^smtp:", "" -replace "^SMTP:", "") }
@@ -62,6 +71,8 @@ function Get-ObjectValue { param([object]$Object,[string]$Name) if($null -eq $Ob
 function Get-ParentDn { param([string]$Dn) if ([string]::IsNullOrWhiteSpace($Dn)) { return "" }; $p=$Dn -split ",",2; if ($p.Count -lt 2) { return "" }; return $p[1] }
 function Get-CnFromDistinguishedName { param([string]$Dn) if([string]::IsNullOrWhiteSpace($Dn)){return ""}; if($Dn -match "^CN=([^,]+)"){return (($Matches[1] -replace "\\, ",", ") -replace "\\,",",")}; return "" }
 function Normalize-EmailAddress { param([object]$Value) return (Normalize-Text (Remove-SmtpPrefix $Value)) }
+function Clear-DirectoryObjectCache { $script:DirectoryObjectCache.Clear(); $script:DirectoryObjectCacheHits=0; $script:DirectoryObjectCacheMisses=0 }
+function Write-Phase { param([string]$Message) Write-Host ("[{0:hh\:mm\:ss}] {1}" -f $script:RunStopwatch.Elapsed,$Message) -ForegroundColor Cyan }
 
 function Get-ObjectEmailAddresses {
     param([object]$Object)
@@ -259,9 +270,16 @@ function Export-ReportWorksheet {
 
 function Get-DirectoryObject {
     param([string]$LdapFilter,[string]$SearchBase)
+    $cacheKey="$SearchBase`n$LdapFilter"
+    if($script:DirectoryObjectCache.ContainsKey($cacheKey)){
+        $script:DirectoryObjectCacheHits++
+        return @($script:DirectoryObjectCache[$cacheKey])
+    }
+    $script:DirectoryObjectCacheMisses++
     $props = @("objectClass","cn","name","mail","proxyAddresses","targetAddress","mailNickname","givenName","sn","displayName","company","department","manager","title","streetAddress","l","co","c","st","physicalDeliveryOfficeName","postalCode","telephoneNumber","facsimileTelephoneNumber","mobile","preferredLanguage","employeeID","userPrincipalName","sAMAccountName","enabled","distinguishedName")
-    if ([string]::IsNullOrWhiteSpace($SearchBase)) { return @(Get-ADObject -LDAPFilter $LdapFilter -Properties $props) }
-    return @(Get-ADObject -LDAPFilter $LdapFilter -SearchBase $SearchBase -Properties $props)
+    $objects=if ([string]::IsNullOrWhiteSpace($SearchBase)) { @(Get-ADObject -LDAPFilter $LdapFilter -Properties $props) }else{ @(Get-ADObject -LDAPFilter $LdapFilter -SearchBase $SearchBase -Properties $props) }
+    $script:DirectoryObjectCache[$cacheKey]=@($objects)
+    return @($objects)
 }
 
 function Get-RecipientType {
@@ -276,6 +294,15 @@ function Get-RecipientType {
 function Test-IsADUserObject {
     param([object]$Object)
     return (@((Get-ObjectValue $Object "objectClass")) -contains "user")
+}
+
+function Test-IsMailContactObject {
+    param([object]$Object)
+    if(@((Get-ObjectValue $Object "objectClass")) -notcontains "contact"){return $false}
+    foreach($value in @((Get-ObjectValue $Object "mail"),(Get-ObjectValue $Object "targetAddress"),(Get-ObjectValue $Object "mailNickname"),(Get-ObjectValue $Object "proxyAddresses"))){
+        if(-not [string]::IsNullOrWhiteSpace(([string]$value))){return $true}
+    }
+    return $false
 }
 
 function Find-ADUserByEmail {
@@ -455,6 +482,39 @@ function Format-PotentialMatchSummary {
     return (@($items) -join " | ")
 }
 
+function Format-MailContactSummary {
+    param([object[]]$Contacts,[string]$PropertyName)
+    return (@($Contacts | ForEach-Object { Get-ObjectValue $_ $PropertyName } | Where-Object { -not [string]::IsNullOrWhiteSpace(([string]$_)) }) -join " | ")
+}
+
+function Find-MailContactCandidatesForHrRow {
+    param([object]$HrRow,[string]$SearchBase)
+    $email=([string](Get-CsvValue $HrRow $CsvEmailColumn)).Trim()
+    $first=([string](Get-CsvValue $HrRow $CsvFirstNameColumn)).Trim()
+    $last=([string](Get-HrLastNameValue $HrRow)).Trim()
+    $title=([string](Get-CsvValue $HrRow $CsvJobTitleColumn)).Trim()
+
+    if(-not [string]::IsNullOrWhiteSpace($email)){
+        $matches=@(Find-MailRecipientByEmail $email $SearchBase | Where-Object { Test-IsMailContactObject $_ })
+        if($matches.Count -gt 0){return [pscustomobject]@{Found=$true;MatchBy="MailContact Email";Confidence="High";Contacts=$matches}}
+    }
+
+    $nameMatches=@(Find-MailRecipientByName $first $last $SearchBase | Where-Object { Test-IsMailContactObject $_ })
+    if($nameMatches.Count -gt 0){
+        $titleMatches=@($nameMatches | Where-Object { (Normalize-Text (Get-ObjectValue $_ "title")) -eq (Normalize-Text $title) })
+        if($titleMatches.Count -gt 0){return [pscustomobject]@{Found=$true;MatchBy="MailContact FirstName + LastName + JobTitle";Confidence="High";Contacts=$titleMatches}}
+        return [pscustomobject]@{Found=$true;MatchBy="MailContact FirstName + LastName only";Confidence="Medium";Contacts=$nameMatches}
+    }
+
+    $potentialMatches=@(Find-MailRecipientByPotentialNameAndTitle $first $last $title $SearchBase | Where-Object { Test-IsMailContactObject $_ })
+    if($potentialMatches.Count -gt 0){return [pscustomobject]@{Found=$true;MatchBy="MailContact Partial/Token Name + JobTitle";Confidence="Medium";Contacts=$potentialMatches}}
+
+    $titleMismatchMatches=@(Find-MailRecipientByPotentialName $first $last $SearchBase | Where-Object { (Test-IsMailContactObject $_) -and ((Normalize-Text (Get-ObjectValue $_ "title")) -ne (Normalize-Text $title)) })
+    if($titleMismatchMatches.Count -gt 0){return [pscustomobject]@{Found=$true;MatchBy="MailContact Partial/Token Name only";Confidence="Low";Contacts=$titleMismatchMatches}}
+
+    return [pscustomobject]@{Found=$false;MatchBy="";Confidence="";Contacts=@()}
+}
+
 function New-Row {
     param([object]$HrRow,[object]$Object,[string]$MatchStatus,[string]$MatchedBy,[bool]$UpdateEligible,[string]$Action,[string]$ActionResult,[string]$Notes,[int]$CsvRow,[int]$PotentialMatchCount=0,[string]$PotentialMatches="")
     $hrEmail=Get-CsvValue $HrRow $CsvEmailColumn; $hrFirst=Get-CsvValue $HrRow $CsvFirstNameColumn; $hrLast=Get-HrLastNameValue $HrRow; $hrLastSource=Get-HrLastNameSource $HrRow; $hrTitle=Get-CsvValue $HrRow $CsvJobTitleColumn; $hrEmp=Get-CsvValue $HrRow $CsvEmployeeIdColumn
@@ -522,7 +582,12 @@ function Resolve-ManagerReferenceToADUser {
         return [pscustomobject]@{Resolved=$false; DistinguishedName=""; Status="ManagerReference matched multiple AD users by employeeID."; MatchCount=$employeeIdMatches.Count}
     }
 
-    $managerRows=@($HrRows | Where-Object { (Normalize-Text (Get-CsvValue $_ $CsvEmployeeIdColumn)) -eq (Normalize-Text $reference) })
+    $managerKey=Normalize-Text $reference
+    if($script:HrRowsByEmployeeId.ContainsKey($managerKey)){
+        $managerRows=@($script:HrRowsByEmployeeId[$managerKey])
+    }else{
+        $managerRows=@()
+    }
     if($managerRows.Count -eq 0){
         return [pscustomobject]@{Resolved=$false; DistinguishedName=""; Status="ManagerReference did not match an AD employeeID or a WorkerID row in the HR CSV."; MatchCount=0}
     }
@@ -559,7 +624,7 @@ function Resolve-ManagerReferenceToADUser {
 }
 
 function New-MismatchRows {
-    param([int]$CsvRow,[object]$HrRow,[object]$User,[array]$Map,[object[]]$HrRows,[string]$SearchBase,[string]$MatchedBy,[string]$MatchStatus,[bool]$EmployeeIDAlreadyPresent,[string]$EmployeeIDActionGuidance)
+    param([int]$CsvRow,[object]$HrRow,[object]$User,[array]$Map,[object[]]$HrRows,[string]$SearchBase,[string]$MatchedBy,[string]$MatchStatus)
     $rows=New-Object System.Collections.Generic.List[object]
     foreach($m in $Map){
         if(-not $m.Compare){continue}
@@ -604,8 +669,6 @@ function New-MismatchRows {
                 ProposedManagerResolution=if($managerResolution){$managerResolution.Status}else{""}
                 MatchedBy=$MatchedBy
                 MatchStatus=$MatchStatus
-                EmployeeIDAlreadyPresent=$EmployeeIDAlreadyPresent
-                EmployeeIDActionGuidance=$EmployeeIDActionGuidance
                 WorkdayAttribute=$m.WorkdayAttribute
                 CsvColumn=$m.CsvColumn
                 ADAttribute=$m.ADAttribute
@@ -642,8 +705,6 @@ function New-EmptyMismatchReportRow {
         ProposedManagerResolution=$null
         MatchedBy=$null
         MatchStatus=$null
-        EmployeeIDAlreadyPresent=$null
-        EmployeeIDActionGuidance=$null
         WorkdayAttribute=$null
         CsvColumn=$null
         ADAttribute=$null
@@ -661,6 +722,8 @@ function New-EmployeeIdApplyReportRows {
     param([object[]]$MatchResults)
     $rows=New-Object System.Collections.Generic.List[object]
     foreach($result in @($MatchResults)){
+        $adObjectType=Get-ObjectValue $result "AD_ObjectType"
+        if($adObjectType -notin @("ADUser","MailUser")){continue}
         $workerId=Get-ObjectValue $result "HR_$CsvEmployeeIdColumn"
         $currentEmployeeId=Get-ObjectValue $result "AD_EmployeeID_Current"
         $actionResult=Get-ObjectValue $result "ActionResult"
@@ -683,7 +746,7 @@ function New-EmployeeIdApplyReportRows {
             MatchStatus=(Get-ObjectValue $result "MatchStatus")
             MatchedBy=(Get-ObjectValue $result "MatchedBy")
             UpdateEligible=(Get-ObjectValue $result "UpdateEligible")
-            AD_ObjectType=(Get-ObjectValue $result "AD_ObjectType")
+            AD_ObjectType=$adObjectType
             AD_SamAccountName=(Get-ObjectValue $result "AD_SamAccountName")
             AD_UserPrincipalName=(Get-ObjectValue $result "AD_UserPrincipalName")
             AD_DistinguishedName=(Get-ObjectValue $result "AD_DistinguishedName")
@@ -694,14 +757,303 @@ function New-EmployeeIdApplyReportRows {
     return $rows
 }
 
-Write-Host "Importing HR CSV: $CsvPath"
+function New-MailContactReviewRows {
+    param([object[]]$MatchResults,[string]$SearchBase,[switch]$CheckMatchedADUsersForMailContacts)
+    $rows=New-Object System.Collections.Generic.List[object]
+    $reviewRowNum=0
+    $reviewTotalRows=[Math]::Max($MatchResults.Count,1)
+    foreach($result in @($MatchResults)){
+        $reviewRowNum++
+        $reviewPercentComplete=[Math]::Min(100,[Math]::Round((($reviewRowNum / $reviewTotalRows)*100),0))
+        Write-Progress -Activity "Checking MailContacts for review" -Status "$reviewPercentComplete% complete - Result row $reviewRowNum of $($MatchResults.Count) (CSV row $(Get-ObjectValue $result "CsvRow"))" -PercentComplete $reviewPercentComplete
+        $adObjectType=Get-ObjectValue $result "AD_ObjectType"
+        $hasMatchedAdUser=($adObjectType -in @("ADUser","MailUser")) -and ((Get-ObjectValue $result "UpdateEligible") -eq $true -or (Get-ObjectValue $result "MatchStatus") -eq "Matched - By WorkerID" -or (Get-ObjectValue $result "ActionResult") -eq "Already correct")
+        $contacts=@()
+        $mailContactMatchBy=""
+        $mailContactConfidence=""
+        if($adObjectType -eq "MailContact"){
+            $contacts=@([pscustomobject]@{
+                displayName=(Get-ObjectValue $result "AD_DisplayName")
+                mail=(Get-ObjectValue $result "AD_Mail")
+                targetAddress=(Get-ObjectValue $result "AD_TargetAddress")
+                DistinguishedName=(Get-ObjectValue $result "AD_DistinguishedName")
+                title=(Get-ObjectValue $result "AD_JobTitle")
+            })
+            $mailContactMatchBy=Get-ObjectValue $result "MatchedBy"
+            $mailContactConfidence=if((Get-ObjectValue $result "MatchStatus") -like "Potential*"){"Medium"}else{"High"}
+        }elseif($CheckMatchedADUsersForMailContacts){
+            $lookup=Find-MailContactCandidatesForHrRow -HrRow $result -SearchBase $SearchBase
+            if($lookup.Found){
+                $contacts=@($lookup.Contacts)
+                $mailContactMatchBy=$lookup.MatchBy
+                $mailContactConfidence=$lookup.Confidence
+            }
+        }
+        if($contacts.Count -eq 0){continue}
+
+        $reviewStatus=if($hasMatchedAdUser){"MailContact cleanup candidate - represented by matched AD user"}else{"MailContact found - no matched AD user in this run"}
+        $recommendedAction=if($hasMatchedAdUser){"Review and approve MailContact DN for deletion after confirming the matched AD user is correct."}else{"Review whether an AD account is missing or whether an existing AD user needs to be approved/matched before deleting the MailContact."}
+        $rows.Add([pscustomobject]@{
+            CsvRow=(Get-ObjectValue $result "CsvRow")
+            MailContactReviewStatus=$reviewStatus
+            RecommendedAction=$recommendedAction
+            MailContactMatchBy=$mailContactMatchBy
+            MailContactMatchConfidence=$mailContactConfidence
+            MailContactCount=$contacts.Count
+            MailContactDisplayNames=(Format-MailContactSummary -Contacts $contacts -PropertyName "displayName")
+            MailContactMail=(Format-MailContactSummary -Contacts $contacts -PropertyName "mail")
+            MailContactTargetAddress=(Format-MailContactSummary -Contacts $contacts -PropertyName "targetAddress")
+            MailContactDistinguishedNames=(Format-MailContactSummary -Contacts $contacts -PropertyName "DistinguishedName")
+            HR_WorkerID=(Get-ObjectValue $result "HR_$CsvEmployeeIdColumn")
+            HR_Email=(Get-ObjectValue $result "HR_$CsvEmailColumn")
+            HR_FirstName=(Get-ObjectValue $result "HR_$CsvFirstNameColumn")
+            HR_LastName=(Get-ObjectValue $result "HR_$CsvLastNameColumn")
+            HR_BusinessTitle=(Get-ObjectValue $result "HR_$CsvJobTitleColumn")
+            ADMatchedObjectType=$adObjectType
+            ADMatchStatus=(Get-ObjectValue $result "MatchStatus")
+            ADMatchedBy=(Get-ObjectValue $result "MatchedBy")
+            ADMatchedUserPrincipalName=(Get-ObjectValue $result "AD_UserPrincipalName")
+            ADMatchedSamAccountName=(Get-ObjectValue $result "AD_SamAccountName")
+            ADMatchedDistinguishedName=(Get-ObjectValue $result "AD_DistinguishedName")
+            Notes=(Get-ObjectValue $result "Notes")
+        })
+    }
+    Write-Progress -Activity "Checking MailContacts for review" -Completed
+    return $rows
+}
+
+function Resolve-RepresentingADUserForMailContactDeletion {
+    param([object]$HrRow,[string]$SearchBase)
+    $workerId=([string](Get-CsvValue $HrRow $CsvEmployeeIdColumn)).Trim()
+    $email=([string](Get-CsvValue $HrRow $CsvEmailColumn)).Trim()
+    $first=([string](Get-CsvValue $HrRow $CsvFirstNameColumn)).Trim()
+    $last=([string](Get-HrLastNameValue $HrRow)).Trim()
+    $title=([string](Get-CsvValue $HrRow $CsvJobTitleColumn)).Trim()
+
+    $matches=@(Find-ADUserByEmployeeId $workerId $SearchBase)
+    if($matches.Count -eq 1){return [pscustomobject]@{Resolved=$true;User=$matches[0];MatchedBy="WorkerID + AD employeeID";Status="Represented by a single AD user matched by WorkerID to AD employeeID."}}
+    if($matches.Count -gt 1){return [pscustomobject]@{Resolved=$false;User=$null;MatchedBy="WorkerID + AD employeeID";Status="WorkerID matched multiple AD users; MailContact deletion skipped."}}
+
+    $matches=@(Find-ADUserByEmail $email $SearchBase)
+    if($matches.Count -eq 1){return [pscustomobject]@{Resolved=$true;User=$matches[0];MatchedBy="Email";Status="Represented by a single AD user matched by HR email."}}
+    if($matches.Count -gt 1){return [pscustomobject]@{Resolved=$false;User=$null;MatchedBy="Email";Status="HR email matched multiple AD users; MailContact deletion skipped."}}
+
+    $matches=@(Find-ADUserByName $first $last $SearchBase)
+    if($matches.Count -eq 1){
+        if((Normalize-Text (Get-ObjectValue $matches[0] "title")) -eq (Normalize-Text $title)){
+            return [pscustomobject]@{Resolved=$true;User=$matches[0];MatchedBy="FirstName + LastName + JobTitle";Status="Represented by a single AD user matched by name and title."}
+        }
+        return [pscustomobject]@{Resolved=$false;User=$null;MatchedBy="FirstName + LastName only";Status="A single AD user matched by name, but title differs; MailContact deletion skipped."}
+    }
+    if($matches.Count -gt 1){
+        $titleMatches=@($matches | Where-Object{(Normalize-Text (Get-ObjectValue $_ "title")) -eq (Normalize-Text $title)})
+        if($titleMatches.Count -eq 1){return [pscustomobject]@{Resolved=$true;User=$titleMatches[0];MatchedBy="FirstName + LastName + JobTitle";Status="Represented by a single AD user matched by name and title."}}
+        return [pscustomobject]@{Resolved=$false;User=$null;MatchedBy="FirstName + LastName";Status="Multiple AD users matched name and no single title match existed; MailContact deletion skipped."}
+    }
+
+    return [pscustomobject]@{Resolved=$false;User=$null;MatchedBy="";Status="No single representing AD user was found for this HR row; MailContact deletion skipped."}
+}
+
+function New-MailContactDeleteReportRows {
+    param([object[]]$HrRows,[string]$SearchBase,[hashtable]$DuplicateApprovedDns)
+    $rows=New-Object System.Collections.Generic.List[object]
+    $deleteRowNum=1
+    $deleteTotalRows=[Math]::Max($HrRows.Count,1)
+    foreach($hrRow in @($HrRows)){
+        $deleteRowNum++
+        $deleteCurrentRow=$deleteRowNum-1
+        $deletePercentComplete=[Math]::Min(100,[Math]::Round((($deleteCurrentRow / $deleteTotalRows)*100),0))
+        Write-Progress -Activity "Checking approved MailContacts for deletion" -Status "$deletePercentComplete% complete - Row $deleteCurrentRow of $($HrRows.Count) (CSV row ${deleteRowNum})" -PercentComplete $deletePercentComplete
+
+        $reviewDecision=Get-CsvValue $hrRow $CsvReviewDecisionColumn
+        $approvedDn=([string](Get-CsvValue $hrRow $CsvApprovedADDistinguishedNameColumn)).Trim()
+        $hasDeleteContext=((Normalize-Text $reviewDecision) -eq (Normalize-Text $ApprovedReviewDecision)) -or -not [string]::IsNullOrWhiteSpace($approvedDn)
+        if(-not $hasDeleteContext){continue}
+
+        $object=$null
+        $objectType=""
+        $resolvedDn=""
+        $targetDisplayName=""
+        $targetMail=""
+        $deleteEligible=$false
+        $action="No action"
+        $actionResult="Skipped"
+        $notes=""
+        $matchCount=0
+        $representingResolution=$null
+        $representingUser=$null
+        $representedByMatchedADUser=$false
+        $representingADObjectType=""
+        $representingADMatchedBy=""
+        $representingADUserPrincipalName=""
+        $representingADSamAccountName=""
+        $representingADDistinguishedName=""
+
+        if((Normalize-Text $reviewDecision) -ne (Normalize-Text $ApprovedReviewDecision)){
+            $notes="ApprovedADDistinguishedName is populated, but ReviewDecision is not Approved. MailContact deletion requires an approved review row."
+        }elseif([string]::IsNullOrWhiteSpace($approvedDn)){
+            $notes="ReviewDecision is Approved, but ApprovedADDistinguishedName is blank."
+        }else{
+            $matches=@(Find-DirectoryObjectByDistinguishedName $approvedDn $SearchBase)
+            $matchCount=$matches.Count
+            if($matches.Count -eq 1){
+                $object=$matches[0]
+                $objectType=Get-RecipientType $object
+                $resolvedDn=Get-ObjectValue $object "DistinguishedName"
+                $targetDisplayName=Get-ObjectValue $object "displayName"
+                $targetMail=Get-ObjectValue $object "mail"
+                $deleteKey=Normalize-Text $approvedDn
+                if($deleteKey -and $DuplicateApprovedDns.ContainsKey($deleteKey)){
+                    $notes="The same ApprovedADDistinguishedName is used on multiple approved rows ($($DuplicateApprovedDns[$deleteKey])). Deletion skipped until the approval is unique."
+                }elseif(-not (Test-IsMailContactObject $object)){
+                    $notes="ApprovedADDistinguishedName resolved to $objectType, but it was not confirmed as a mail-enabled contact. Deletion skipped."
+                }else{
+                    $representingResolution=Resolve-RepresentingADUserForMailContactDeletion -HrRow $hrRow -SearchBase $SearchBase
+                    if($representingResolution.Resolved){
+                        $representingUser=$representingResolution.User
+                        $representedByMatchedADUser=$true
+                        $representingADObjectType=Get-RecipientType $representingUser
+                        $representingADMatchedBy=$representingResolution.MatchedBy
+                        $representingADUserPrincipalName=Get-ObjectValue $representingUser "userPrincipalName"
+                        $representingADSamAccountName=Get-ObjectValue $representingUser "sAMAccountName"
+                        $representingADDistinguishedName=Get-ObjectValue $representingUser "DistinguishedName"
+                    }else{
+                        $notes="Approved MailContact was confirmed, but it is not represented by a single matched AD user object. $($representingResolution.Status)"
+                    }
+                }
+                if($representedByMatchedADUser){
+                    $deleteEligible=$true
+                    if($Apply){
+                        $action="Delete MailContact"
+                        if($PSCmdlet.ShouldProcess($resolvedDn,"Delete MailContact")){
+                            Remove-ADObject -Identity $resolvedDn -Confirm:$false -ErrorAction Stop
+                            Clear-DirectoryObjectCache
+                            $actionResult="Deleted"
+                            $notes="Approved MailContact was confirmed, represented by matched $representingADObjectType '$representingADDistinguishedName', and deleted."
+                        }else{
+                            $actionResult="Skipped by ShouldProcess"
+                            $notes="Approved MailContact was confirmed and represented by matched $representingADObjectType '$representingADDistinguishedName', but deletion was skipped by ShouldProcess."
+                        }
+                    }else{
+                        $action="Would delete MailContact"
+                        $actionResult="Dry run only"
+                        $notes="Approved MailContact was confirmed and represented by matched $representingADObjectType '$representingADDistinguishedName'. Supply -Apply with -DeleteApprovedMailContacts to delete it."
+                    }
+                }
+            }elseif($matches.Count -eq 0){
+                $notes="ApprovedADDistinguishedName did not resolve to a directory object."
+            }else{
+                $notes="ApprovedADDistinguishedName resolved to multiple directory objects. Deletion skipped."
+            }
+        }
+
+        $rows.Add([pscustomobject]@{
+            CsvRow=$deleteRowNum
+            ReviewDecision=$reviewDecision
+            ApprovedADDistinguishedName=$approvedDn
+            DeleteEligible=$deleteEligible
+            Action=$action
+            ActionResult=$actionResult
+            DirectoryMatchCount=$matchCount
+            TargetObjectType=$objectType
+            TargetDisplayName=$targetDisplayName
+            TargetMail=$targetMail
+            TargetDistinguishedName=$resolvedDn
+            RepresentedByMatchedADUser=$representedByMatchedADUser
+            RepresentingADObjectType=$representingADObjectType
+            RepresentingADMatchedBy=$representingADMatchedBy
+            RepresentingADUserPrincipalName=$representingADUserPrincipalName
+            RepresentingADSamAccountName=$representingADSamAccountName
+            RepresentingADDistinguishedName=$representingADDistinguishedName
+            HR_WorkerID=(Get-CsvValue $hrRow $CsvEmployeeIdColumn)
+            HR_FirstName=(Get-CsvValue $hrRow $CsvFirstNameColumn)
+            HR_LastName=(Get-HrLastNameValue $hrRow)
+            HR_LastNameSource=(Get-HrLastNameSource $hrRow)
+            HR_BusinessTitle=(Get-CsvValue $hrRow $CsvJobTitleColumn)
+            Notes=$notes
+        })
+    }
+    Write-Progress -Activity "Checking approved MailContacts for deletion" -Completed
+    if($rows.Count -eq 0){
+        $rows.Add([pscustomobject]@{
+            CsvRow=$null
+            ReviewDecision=$null
+            ApprovedADDistinguishedName=$null
+            DeleteEligible=$false
+            Action="No action"
+            ActionResult="No approved MailContacts found"
+            DirectoryMatchCount=0
+            TargetObjectType=$null
+            TargetDisplayName=$null
+            TargetMail=$null
+            TargetDistinguishedName=$null
+            RepresentedByMatchedADUser=$false
+            RepresentingADObjectType=$null
+            RepresentingADMatchedBy=$null
+            RepresentingADUserPrincipalName=$null
+            RepresentingADSamAccountName=$null
+            RepresentingADDistinguishedName=$null
+            HR_WorkerID=$null
+            HR_FirstName=$null
+            HR_LastName=$null
+            HR_LastNameSource=$null
+            HR_BusinessTitle=$null
+            Notes="No rows had ReviewDecision Approved or ApprovedADDistinguishedName populated."
+        })
+    }
+    return $rows
+}
+
+Write-Phase "Starting readiness run."
+Write-Phase "Loading ActiveDirectory module."
 Import-Module ActiveDirectory -ErrorAction Stop
+Write-Phase "ActiveDirectory module loaded."
+Write-Phase "Checking HR CSV path: $CsvPath"
 if(-not(Test-Path $CsvPath)){throw "CSV path not found: $CsvPath"}
+Write-Phase "Importing HR CSV."
 $hrRows=@(Import-Csv $CsvPath)
+Write-Phase "Imported $($hrRows.Count) HR rows."
 $required=@($CsvEmailColumn,$CsvFirstNameColumn,$CsvJobTitleColumn,$CsvEmployeeIdColumn)
 $cols=@($hrRows[0].PSObject.Properties.Name)
 foreach($c in $required){if(($cols -notcontains $c) -and ($cols -notcontains "HR_$c")){throw "Required CSV column not found: '$c' or 'HR_$c'. Available columns: $($cols -join ', ')"}}
 if(($cols -notcontains $CsvLastNameColumn) -and ($cols -notcontains "HR_$CsvLastNameColumn") -and ($cols -notcontains "LastName") -and ($cols -notcontains "HR_LastName")){throw "Required CSV last-name column not found: '$CsvLastNameColumn', 'HR_$CsvLastNameColumn', 'LastName', or 'HR_LastName'. Available columns: $($cols -join ', ')"}
+Write-Phase "Validated required CSV columns."
+
+Write-Phase "Indexing HR rows and approved review decisions."
+$script:HrRowsByEmployeeId=@{}
+$approvedReviewDnUseCounts=@{}
+$approvedReviewDnUseRows=@{}
+$csvRowNum=1
+foreach($hrRow in $hrRows){
+    $csvRowNum++
+    $employeeIdKey=Normalize-Text (Get-CsvValue $hrRow $CsvEmployeeIdColumn)
+    if(-not [string]::IsNullOrWhiteSpace($employeeIdKey)){
+        if(-not $script:HrRowsByEmployeeId.ContainsKey($employeeIdKey)){
+            $script:HrRowsByEmployeeId[$employeeIdKey]=New-Object System.Collections.Generic.List[object]
+        }
+        $script:HrRowsByEmployeeId[$employeeIdKey].Add($hrRow)
+    }
+
+    $reviewDecision=Get-CsvValue $hrRow $CsvReviewDecisionColumn
+    $approvedDn=Get-CsvValue $hrRow $CsvApprovedADDistinguishedNameColumn
+    if((Normalize-Text $reviewDecision) -ne (Normalize-Text $ApprovedReviewDecision) -or [string]::IsNullOrWhiteSpace($approvedDn)){continue}
+    $approvedUsageKey=Normalize-Text $approvedDn
+    if([string]::IsNullOrWhiteSpace($approvedUsageKey)){continue}
+    if(-not $approvedReviewDnUseCounts.ContainsKey($approvedUsageKey)){
+        $approvedReviewDnUseCounts[$approvedUsageKey]=0
+        $approvedReviewDnUseRows[$approvedUsageKey]=New-Object System.Collections.Generic.List[int]
+    }
+    $approvedReviewDnUseCounts[$approvedUsageKey]++
+    $approvedReviewDnUseRows[$approvedUsageKey].Add($csvRowNum)
+}
+
+$duplicateApprovedDns=@{}
+foreach($approvedUsageKey in @($approvedReviewDnUseCounts.Keys)){
+    if($approvedReviewDnUseCounts[$approvedUsageKey] -gt 1){
+        $duplicateApprovedDns[$approvedUsageKey]=($approvedReviewDnUseRows[$approvedUsageKey] -join ", ")
+    }
+}
+Write-Phase "Indexed HR rows. Duplicate approved DNs found: $($duplicateApprovedDns.Count)."
 
 $map=@(
     [pscustomobject]@{WorkdayAttribute="FirstName";CsvColumn=$CsvFirstNameColumn;ADAttribute="givenName";MappingType="Create + update";CompareMode="Direct";Compare=$true},
@@ -715,104 +1067,74 @@ $map=@(
 
 $results=New-Object System.Collections.Generic.List[object]
 $mismatches=New-Object System.Collections.Generic.List[object]
-$systemMismatchMatchSources=New-Object System.Collections.Generic.List[object]
+$systemMismatchComparisonResults=New-Object System.Collections.Generic.List[object]
 $reservedExactAdUserDns=@{}
 $confirmedAdUserDns=@{}
-$approvedReviewDnUseCounts=@{}
-$approvedReviewDnUseRows=@{}
-
-$approvedScanRowNum=1
-$approvedScanTotalRows=[Math]::Max($hrRows.Count,1)
-foreach($r in $hrRows){
-    $approvedScanRowNum++
-    $approvedScanCurrentRow=$approvedScanRowNum-1
-    $approvedScanPercentComplete=[Math]::Min(100,[Math]::Round((($approvedScanCurrentRow / $approvedScanTotalRows)*100),0))
-    Write-Progress -Activity "Scanning approved review decisions" -Status "$approvedScanPercentComplete% complete - Row $approvedScanCurrentRow of $($hrRows.Count) (CSV row ${approvedScanRowNum})" -PercentComplete $approvedScanPercentComplete
-    $reviewDecision=Get-CsvValue $r $CsvReviewDecisionColumn
-    $approvedDn=Get-CsvValue $r $CsvApprovedADDistinguishedNameColumn
-    if((Normalize-Text $reviewDecision) -ne (Normalize-Text $ApprovedReviewDecision) -or [string]::IsNullOrWhiteSpace($approvedDn)){continue}
-
-    $approvedUsageMatches=@(Find-DirectoryObjectByDistinguishedName $approvedDn $SearchBase)
-    if($approvedUsageMatches.Count -eq 1){
-        $approvedUsageKey=Normalize-Text (Get-ObjectValue $approvedUsageMatches[0] "DistinguishedName")
-    }else{
-        $approvedUsageKey=Normalize-Text $approvedDn
-    }
-    if([string]::IsNullOrWhiteSpace($approvedUsageKey)){continue}
-    if(-not $approvedReviewDnUseCounts.ContainsKey($approvedUsageKey)){
-        $approvedReviewDnUseCounts[$approvedUsageKey]=0
-        $approvedReviewDnUseRows[$approvedUsageKey]=New-Object System.Collections.Generic.List[int]
-    }
-    $approvedReviewDnUseCounts[$approvedUsageKey]++
-    $approvedReviewDnUseRows[$approvedUsageKey].Add($approvedScanRowNum)
-}
-Write-Progress -Activity "Scanning approved review decisions" -Completed
-
-$duplicateApprovedDns=@{}
-foreach($approvedUsageKey in @($approvedReviewDnUseCounts.Keys)){
-    if($approvedReviewDnUseCounts[$approvedUsageKey] -gt 1){
-        $duplicateApprovedDns[$approvedUsageKey]=($approvedReviewDnUseRows[$approvedUsageKey] -join ", ")
-    }
-}
 
 $reservationScanRowNum=1
 $reservationScanTotalRows=[Math]::Max($hrRows.Count,1)
-foreach($r in $hrRows){
-    $reservationScanRowNum++
-    $reservationScanCurrentRow=$reservationScanRowNum-1
-    $reservationScanPercentComplete=[Math]::Min(100,[Math]::Round((($reservationScanCurrentRow / $reservationScanTotalRows)*100),0))
-    Write-Progress -Activity "Reserving exact AD matches" -Status "$reservationScanPercentComplete% complete - Row $reservationScanCurrentRow of $($hrRows.Count) (CSV row ${reservationScanRowNum})" -PercentComplete $reservationScanPercentComplete
-    $email=([string](Get-CsvValue $r $CsvEmailColumn)).Trim()
-    $first=([string](Get-CsvValue $r $CsvFirstNameColumn)).Trim()
-    $last=([string](Get-HrLastNameValue $r)).Trim()
-    $title=([string](Get-CsvValue $r $CsvJobTitleColumn)).Trim()
-    $emp=([string](Get-CsvValue $r $CsvEmployeeIdColumn)).Trim()
-    if([string]::IsNullOrWhiteSpace($emp)){continue}
+foreach($approvedUsageKey in @($approvedReviewDnUseCounts.Keys)){
+    if(-not $duplicateApprovedDns.ContainsKey($approvedUsageKey)){
+        $reservedExactAdUserDns[$approvedUsageKey]=$true
+    }
+}
+if($ReserveExactMatches -and -not $ApprovedOnly){
+    Write-Phase "Reserving exact AD matches."
+    foreach($r in $hrRows){
+        $reservationScanRowNum++
+        $reservationScanCurrentRow=$reservationScanRowNum-1
+        $reservationScanPercentComplete=[Math]::Min(100,[Math]::Round((($reservationScanCurrentRow / $reservationScanTotalRows)*100),0))
+        Write-Progress -Activity "Reserving exact AD matches" -Status "$reservationScanPercentComplete% complete - Row $reservationScanCurrentRow of $($hrRows.Count) (CSV row ${reservationScanRowNum})" -PercentComplete $reservationScanPercentComplete
+        $email=([string](Get-CsvValue $r $CsvEmailColumn)).Trim()
+        $first=([string](Get-CsvValue $r $CsvFirstNameColumn)).Trim()
+        $last=([string](Get-HrLastNameValue $r)).Trim()
+        $title=([string](Get-CsvValue $r $CsvJobTitleColumn)).Trim()
+        $emp=([string](Get-CsvValue $r $CsvEmployeeIdColumn)).Trim()
+        if([string]::IsNullOrWhiteSpace($emp)){continue}
 
-    $reviewDecision=Get-CsvValue $r $CsvReviewDecisionColumn
-    if((Normalize-Text $reviewDecision) -eq (Normalize-Text $IgnoredReviewDecision)){continue}
-    $approvedDn=Get-CsvValue $r $CsvApprovedADDistinguishedNameColumn
-    if((Normalize-Text $reviewDecision) -eq (Normalize-Text $ApprovedReviewDecision) -and -not [string]::IsNullOrWhiteSpace($approvedDn)){
-        $approvedMatches=@(Find-DirectoryObjectByDistinguishedName $approvedDn $SearchBase)
-        if($approvedMatches.Count -eq 1){
-            $approvedReservationKey=Normalize-Text (Get-ObjectValue $approvedMatches[0] "DistinguishedName")
-        }else{
+        $reviewDecision=Get-CsvValue $r $CsvReviewDecisionColumn
+        if((Normalize-Text $reviewDecision) -eq (Normalize-Text $IgnoredReviewDecision)){continue}
+        $approvedDn=Get-CsvValue $r $CsvApprovedADDistinguishedNameColumn
+        if((Normalize-Text $reviewDecision) -eq (Normalize-Text $ApprovedReviewDecision) -and -not [string]::IsNullOrWhiteSpace($approvedDn)){
             $approvedReservationKey=Normalize-Text $approvedDn
+            if($approvedReservationKey -and $duplicateApprovedDns.ContainsKey($approvedReservationKey)){continue}
+            if($approvedReservationKey){$reservedExactAdUserDns[$approvedReservationKey]=$true}
+            continue
         }
-        if($approvedReservationKey -and $duplicateApprovedDns.ContainsKey($approvedReservationKey)){continue}
-        if($approvedMatches.Count -eq 1 -and (Test-IsADUserObject $approvedMatches[0])){
-            $reservedDn=Normalize-Text (Get-ObjectValue $approvedMatches[0] "DistinguishedName")
+
+        $employeeIdMatches=@(Find-ADUserByEmployeeId $emp $SearchBase)
+        if($employeeIdMatches.Count -eq 1){
+            $reservedDn=Normalize-Text (Get-ObjectValue $employeeIdMatches[0] "DistinguishedName")
             if($reservedDn){$reservedExactAdUserDns[$reservedDn]=$true}
             continue
         }
-    }
 
-    $employeeIdMatches=@(Find-ADUserByEmployeeId $emp $SearchBase)
-    if($employeeIdMatches.Count -eq 1){
-        $reservedDn=Normalize-Text (Get-ObjectValue $employeeIdMatches[0] "DistinguishedName")
-        if($reservedDn){$reservedExactAdUserDns[$reservedDn]=$true}
-        continue
-    }
+        $emailMatches=@(Find-ADUserByEmail $email $SearchBase)
+        if($emailMatches.Count -eq 1){
+            $reservedDn=Normalize-Text (Get-ObjectValue $emailMatches[0] "DistinguishedName")
+            if($reservedDn){$reservedExactAdUserDns[$reservedDn]=$true}
+            continue
+        }
 
-    $emailMatches=@(Find-ADUserByEmail $email $SearchBase)
-    if($emailMatches.Count -eq 1){
-        $reservedDn=Normalize-Text (Get-ObjectValue $emailMatches[0] "DistinguishedName")
-        if($reservedDn){$reservedExactAdUserDns[$reservedDn]=$true}
-        continue
+        $nameMatches=@(Find-ADUserByName $first $last $SearchBase)
+        $titleMatches=@($nameMatches | Where-Object{(Normalize-Text (Get-ObjectValue $_ "title")) -eq (Normalize-Text $title)})
+        if($titleMatches.Count -eq 1){
+            $reservedDn=Normalize-Text (Get-ObjectValue $titleMatches[0] "DistinguishedName")
+            if($reservedDn){$reservedExactAdUserDns[$reservedDn]=$true}
+        }
     }
-
-    $nameMatches=@(Find-ADUserByName $first $last $SearchBase)
-    $titleMatches=@($nameMatches | Where-Object{(Normalize-Text (Get-ObjectValue $_ "title")) -eq (Normalize-Text $title)})
-    if($titleMatches.Count -eq 1){
-        $reservedDn=Normalize-Text (Get-ObjectValue $titleMatches[0] "DistinguishedName")
-        if($reservedDn){$reservedExactAdUserDns[$reservedDn]=$true}
-    }
+    Write-Progress -Activity "Reserving exact AD matches" -Completed
+    Write-Phase "Finished reserving exact AD matches."
+}elseif($ApprovedOnly){
+    Write-Phase "Skipped exact AD match reservation because -ApprovedOnly was supplied."
+}else{
+    Write-Phase "Skipped exact AD match reservation. Use -ReserveExactMatches for the slower pre-reservation scan."
 }
-Write-Progress -Activity "Reserving exact AD matches" -Completed
 
 $rowNum=1
 $totalRows=[Math]::Max($hrRows.Count,1)
-$matchingProgressActivity=if($CheckSystemMismatch){"Matching HR users to AD and checking system mismatches"}else{"Matching HR users to AD"}
+$matchingProgressActivity=if($ApprovedOnly){"Processing approved review decisions"}elseif($CheckSystemMismatch){"Matching HR users to AD and checking system mismatches"}else{"Matching HR users to AD"}
+Write-Phase $matchingProgressActivity
 foreach($r in $hrRows){
     $rowNum++
     $email=([string](Get-CsvValue $r $CsvEmailColumn)).Trim(); $first=([string](Get-CsvValue $r $CsvFirstNameColumn)).Trim(); $last=([string](Get-HrLastNameValue $r)).Trim(); $title=([string](Get-CsvValue $r $CsvJobTitleColumn)).Trim(); $emp=([string](Get-CsvValue $r $CsvEmployeeIdColumn)).Trim()
@@ -820,6 +1142,9 @@ foreach($r in $hrRows){
     $percentComplete=[Math]::Min(100,[Math]::Round((($currentRow / $totalRows)*100),0))
     Write-Progress -Activity $matchingProgressActivity -Status "$percentComplete% complete - Row $currentRow of $($hrRows.Count) (CSV row ${rowNum}): $email" -PercentComplete $percentComplete
     $reviewDecision=Get-CsvValue $r $CsvReviewDecisionColumn
+    if($ApprovedOnly -and (Normalize-Text $reviewDecision) -ne (Normalize-Text $ApprovedReviewDecision)){
+        continue
+    }
     if((Normalize-Text $reviewDecision) -eq (Normalize-Text $IgnoredReviewDecision)){
         $results.Add((New-Row $r $null "Ignored - ReviewDecision" "ReviewDecision" $false "No action" "Skipped" "ReviewDecision is Ignore. No matching or employeeID update is attempted for this row." $rowNum))
         continue
@@ -832,19 +1157,13 @@ foreach($r in $hrRows){
             $results.Add((New-Row $r $null "ReviewDecision Invalid - Missing ApprovedADDistinguishedName" "ReviewDecision" $false "No action" "Skipped" "ReviewDecision is approved, but ApprovedADDistinguishedName is blank. Add the approved AD user distinguishedName before using -Apply." $rowNum))
             continue
         }
-        $approvedMatches=@(Find-DirectoryObjectByDistinguishedName $approvedDn $SearchBase)
-        if($approvedMatches.Count -eq 1){
-            $approvedDuplicateKey=Normalize-Text (Get-ObjectValue $approvedMatches[0] "DistinguishedName")
-            $approvedDuplicateObject=$approvedMatches[0]
-        }else{
-            $approvedDuplicateKey=Normalize-Text $approvedDn
-            $approvedDuplicateObject=$null
-        }
+        $approvedDuplicateKey=Normalize-Text $approvedDn
         if($approvedDuplicateKey -and $duplicateApprovedDns.ContainsKey($approvedDuplicateKey)){
             $duplicateRows=$duplicateApprovedDns[$approvedDuplicateKey]
-            $results.Add((New-Row $r $approvedDuplicateObject "ReviewDecision Invalid - Duplicate ApprovedADDistinguishedName" "ReviewDecision" $false "No action" "Skipped" "ReviewDecision is approved, but the same ApprovedADDistinguishedName is used on multiple CSV rows ($duplicateRows). None of the duplicated approved rows are processed. Keep this distinguishedName approved on exactly one row." $rowNum))
+            $results.Add((New-Row $r $null "ReviewDecision Invalid - Duplicate ApprovedADDistinguishedName" "ReviewDecision" $false "No action" "Skipped" "ReviewDecision is approved, but the same ApprovedADDistinguishedName is used on multiple CSV rows ($duplicateRows). None of the duplicated approved rows are processed. Keep this distinguishedName approved on exactly one row." $rowNum))
             continue
         }
+        $approvedMatches=@(Find-DirectoryObjectByDistinguishedName $approvedDn $SearchBase)
         if($approvedMatches.Count -eq 1){
             $approvedObject=$approvedMatches[0]
             $approvedObjectType=Get-RecipientType $approvedObject
@@ -864,62 +1183,61 @@ foreach($r in $hrRows){
             continue
         }
     }
-    $employeeIdMatches=@(Find-ADUserByEmployeeId $emp $SearchBase)
-    if($null -eq $user){
-        if($employeeIdMatches.Count -eq 1){$user=$employeeIdMatches[0];$status="Matched";$by="WorkerID + AD employeeID";$eligible=$true;$notes="Single AD user matched by WorkerID to AD employeeID."}
-        elseif($employeeIdMatches.Count -gt 1){$results.Add((New-Row $r $null "Ambiguous - Multiple EmployeeID Matches" "WorkerID + AD employeeID" $false "No action" "Skipped" "Multiple AD users matched the HR WorkerID value in AD employeeID." $rowNum));continue}
-    }
-    $emailMatches=@(Find-ADUserByEmail $email $SearchBase)
-    if($null -eq $user){
-        if($emailMatches.Count -eq 1){$user=$emailMatches[0];$status="Matched";$by="Email";$eligible=$true;$notes="Single AD user matched by HR email address."}
-        elseif($emailMatches.Count -gt 1){$results.Add((New-Row $r $null "Ambiguous - Multiple Email Matches" "Email" $false "No action" "Skipped" "Multiple AD users matched the HR email value." $rowNum));continue}
-    }
-    if($null -eq $user){
-        $nameMatches=@(Find-ADUserByName $first $last $SearchBase)
-        if($nameMatches.Count -eq 0){
-            $partialAdMatches=@(Find-ADUserByPotentialNameAndTitle $first $last $title $SearchBase | Where-Object { $candidateDn=Normalize-Text (Get-ObjectValue $_ "DistinguishedName"); -not $confirmedAdUserDns.ContainsKey($candidateDn) -and -not $reservedExactAdUserDns.ContainsKey($candidateDn) })
-            if($partialAdMatches.Count -gt 0){
-                if($partialAdMatches.Count -eq 1){
-                    $results.Add((New-Row $r $partialAdMatches[0] "Potential Match - Name Variant" "Partial/Token Name + JobTitle" $false "No action" "Skipped" "An AD user matched job title plus partial or tokenized first/last name values. Review likely spelling, preferred-name, shortened-name, or multi-part-name differences before taking action." $rowNum 1 (Format-PotentialMatchSummary $partialAdMatches $first)))
-                }else{
-                    $results.Add((New-Row $r $null "Potential Matches - Name Variant" "Partial/Token Name + JobTitle" $false "No action" "Skipped" "Multiple AD users matched job title plus partial or tokenized first/last name values. Review the PotentialMatches column before taking action." $rowNum $partialAdMatches.Count (Format-PotentialMatchSummary $partialAdMatches $first)))
-                }
-                continue
-            }
-            $titleMismatchAdMatches=@(Find-ADUserByPotentialName $first $last $SearchBase | Where-Object { $candidateDn=Normalize-Text (Get-ObjectValue $_ "DistinguishedName"); ((Normalize-Text (Get-ObjectValue $_ "title")) -ne (Normalize-Text $title)) -and -not $confirmedAdUserDns.ContainsKey($candidateDn) -and -not $reservedExactAdUserDns.ContainsKey($candidateDn) })
-            if($titleMismatchAdMatches.Count -gt 0){
-                if($titleMismatchAdMatches.Count -eq 1){
-                    $results.Add((New-Row $r $titleMismatchAdMatches[0] "Potential Match - Name Variant Title Mismatch" "Partial/Token Name only" $false "No action" "Skipped" "An AD user matched partial or tokenized first/last name values, but job title differs or is missing. Review likely spelling, preferred-name, shortened-name, multi-part-name, or title differences before taking action." $rowNum 1 (Format-PotentialMatchSummary $titleMismatchAdMatches $first)))
-                }else{
-                    $results.Add((New-Row $r $null "Potential Matches - Name Variant Title Mismatch" "Partial/Token Name only" $false "No action" "Skipped" "Multiple AD users matched partial or tokenized first/last name values, but job title differs or is missing. Review the PotentialMatches column before taking action." $rowNum $titleMismatchAdMatches.Count (Format-PotentialMatchSummary $titleMismatchAdMatches $first)))
-                }
-                continue
-            }
-            if(-not(Add-MailRecipientFallback $rowNum $r $email $first $last $title $SearchBase $results)){ $results.Add((New-Row $r $null "No Match" "" $false "No action" "Skipped" "No AD user, MailContact, or MailUser matched." $rowNum))}
-            continue
+    if(-not $ApprovedOnly){
+        $employeeIdMatches=@(Find-ADUserByEmployeeId $emp $SearchBase)
+        if($null -eq $user){
+            if($employeeIdMatches.Count -eq 1){$user=$employeeIdMatches[0];$status="Matched - By WorkerID";$by="WorkerID + AD employeeID";$eligible=$true;$notes="Single AD user matched by WorkerID to AD employeeID. No employeeID write is needed when AD employeeID already matches HR WorkerID."}
+            elseif($employeeIdMatches.Count -gt 1){$results.Add((New-Row $r $null "Ambiguous - Multiple EmployeeID Matches" "WorkerID + AD employeeID" $false "No action" "Skipped" "Multiple AD users matched the HR WorkerID value in AD employeeID." $rowNum));continue}
         }
-        $titleMatches=@($nameMatches | Where-Object{(Normalize-Text (Get-ObjectValue $_ "title")) -eq (Normalize-Text $title)})
-        if($titleMatches.Count -eq 1){$user=$titleMatches[0];$status="Matched";$by="FirstName + LastName + JobTitle";$eligible=$true;$notes="Email did not match, but a single AD user matched name and title."}
-        elseif($titleMatches.Count -gt 1){$results.Add((New-Row $r $null "Ambiguous - Multiple Name and Title Matches" "FirstName + LastName + JobTitle" $false "No action" "Skipped" "Multiple AD users matched name and title." $rowNum));continue}
-        elseif($nameMatches.Count -eq 1){$user=$nameMatches[0];$status="Potential Match - Title Mismatch";$by="FirstName + LastName only";$eligible=$false;$notes="Single AD user matched first and last name, but title differs."}
-        else{$results.Add((New-Row $r $null "Ambiguous - Multiple Name Matches" "FirstName + LastName" $false "No action" "Skipped" "Multiple AD users matched name but no single title match." $rowNum));continue}
+        $emailMatches=@(Find-ADUserByEmail $email $SearchBase)
+        if($null -eq $user){
+            if($emailMatches.Count -eq 1){$user=$emailMatches[0];$status="Matched";$by="Email";$eligible=$true;$notes="Single AD user matched by HR email address."}
+            elseif($emailMatches.Count -gt 1){$results.Add((New-Row $r $null "Ambiguous - Multiple Email Matches" "Email" $false "No action" "Skipped" "Multiple AD users matched the HR email value." $rowNum));continue}
+        }
+        if($null -eq $user){
+            $nameMatches=@(Find-ADUserByName $first $last $SearchBase)
+            if($nameMatches.Count -eq 0){
+                $partialAdMatches=@(Find-ADUserByPotentialNameAndTitle $first $last $title $SearchBase | Where-Object { $candidateDn=Normalize-Text (Get-ObjectValue $_ "DistinguishedName"); -not $confirmedAdUserDns.ContainsKey($candidateDn) -and -not $reservedExactAdUserDns.ContainsKey($candidateDn) })
+                if($partialAdMatches.Count -gt 0){
+                    if($partialAdMatches.Count -eq 1){
+                        $results.Add((New-Row $r $partialAdMatches[0] "Potential Match - Name Variant" "Partial/Token Name + JobTitle" $false "No action" "Skipped" "An AD user matched job title plus partial or tokenized first/last name values. Review likely spelling, preferred-name, shortened-name, or multi-part-name differences before taking action." $rowNum 1 (Format-PotentialMatchSummary $partialAdMatches $first)))
+                    }else{
+                        $results.Add((New-Row $r $null "Potential Matches - Name Variant" "Partial/Token Name + JobTitle" $false "No action" "Skipped" "Multiple AD users matched job title plus partial or tokenized first/last name values. Review the PotentialMatches column before taking action." $rowNum $partialAdMatches.Count (Format-PotentialMatchSummary $partialAdMatches $first)))
+                    }
+                    continue
+                }
+                $titleMismatchAdMatches=@(Find-ADUserByPotentialName $first $last $SearchBase | Where-Object { $candidateDn=Normalize-Text (Get-ObjectValue $_ "DistinguishedName"); ((Normalize-Text (Get-ObjectValue $_ "title")) -ne (Normalize-Text $title)) -and -not $confirmedAdUserDns.ContainsKey($candidateDn) -and -not $reservedExactAdUserDns.ContainsKey($candidateDn) })
+                if($titleMismatchAdMatches.Count -gt 0){
+                    if($titleMismatchAdMatches.Count -eq 1){
+                        $results.Add((New-Row $r $titleMismatchAdMatches[0] "Potential Match - Name Variant Title Mismatch" "Partial/Token Name only" $false "No action" "Skipped" "An AD user matched partial or tokenized first/last name values, but job title differs or is missing. Review likely spelling, preferred-name, shortened-name, multi-part-name, or title differences before taking action." $rowNum 1 (Format-PotentialMatchSummary $titleMismatchAdMatches $first)))
+                    }else{
+                        $results.Add((New-Row $r $null "Potential Matches - Name Variant Title Mismatch" "Partial/Token Name only" $false "No action" "Skipped" "Multiple AD users matched partial or tokenized first/last name values, but job title differs or is missing. Review the PotentialMatches column before taking action." $rowNum $titleMismatchAdMatches.Count (Format-PotentialMatchSummary $titleMismatchAdMatches $first)))
+                    }
+                    continue
+                }
+                if(-not(Add-MailRecipientFallback $rowNum $r $email $first $last $title $SearchBase $results)){ $results.Add((New-Row $r $null "No Match" "" $false "No action" "Skipped" "No AD user, MailContact, or MailUser matched." $rowNum))}
+                continue
+            }
+            $titleMatches=@($nameMatches | Where-Object{(Normalize-Text (Get-ObjectValue $_ "title")) -eq (Normalize-Text $title)})
+            if($titleMatches.Count -eq 1){$user=$titleMatches[0];$status="Matched";$by="FirstName + LastName + JobTitle";$eligible=$true;$notes="Email did not match, but a single AD user matched name and title."}
+            elseif($titleMatches.Count -gt 1){$results.Add((New-Row $r $null "Ambiguous - Multiple Name and Title Matches" "FirstName + LastName + JobTitle" $false "No action" "Skipped" "Multiple AD users matched name and title." $rowNum));continue}
+            elseif($nameMatches.Count -eq 1){$user=$nameMatches[0];$status="Potential Match - Title Mismatch";$by="FirstName + LastName only";$eligible=$false;$notes="Single AD user matched first and last name, but title differs."}
+            else{$results.Add((New-Row $r $null "Ambiguous - Multiple Name Matches" "FirstName + LastName" $false "No action" "Skipped" "Multiple AD users matched name but no single title match." $rowNum));continue}
+        }
     }
     if($CheckSystemMismatch -and $user){
-        $employeeIdAlreadyPresent=((Normalize-Text (Get-ObjectValue $user "employeeID")) -eq (Normalize-Text $emp))
-        $matchedByWorkerId=($by -eq "WorkerID + AD employeeID")
-        $employeeIdGuidance=if($matchedByWorkerId){"No further EmployeeID action needed - matched by WorkerID already present in AD employeeID."}elseif($employeeIdAlreadyPresent){"No further EmployeeID action needed - AD employeeID already matches HR WorkerID."}else{"WorkerID still needs to be applied - system mismatch comparison used a non-WorkerID match."}
-        $systemMismatchMatchSources.Add([pscustomobject]@{
+        $mismatchRows=@(New-MismatchRows -CsvRow $rowNum -HrRow $r -User $user -Map $map -HrRows $hrRows -SearchBase $SearchBase -MatchedBy $by -MatchStatus $status)
+        foreach($mm in $mismatchRows){ $mismatches.Add($mm) }
+        $systemMismatchComparisonResults.Add([pscustomobject]@{
             CsvRow=$rowNum
             HR_WorkerID=$emp
             MatchedBy=$by
             MatchStatus=$status
             AD_UserPrincipalName=(Get-ObjectValue $user "userPrincipalName")
             AD_SamAccountName=(Get-ObjectValue $user "sAMAccountName")
-            AD_EmployeeID_Current=(Get-ObjectValue $user "employeeID")
-            EmployeeIDAlreadyPresent=$employeeIdAlreadyPresent
-            EmployeeIDActionGuidance=$employeeIdGuidance
+            AttributeMismatchCount=$mismatchRows.Count
+            SystemMismatchStatus=if($mismatchRows.Count -gt 0){"Has HR/AD attribute mismatch"}else{"No HR/AD attribute mismatches"}
         })
-        foreach($mm in @(New-MismatchRows -CsvRow $rowNum -HrRow $r -User $user -Map $map -HrRows $hrRows -SearchBase $SearchBase -MatchedBy $by -MatchStatus $status -EmployeeIDAlreadyPresent $employeeIdAlreadyPresent -EmployeeIDActionGuidance $employeeIdGuidance)){ $mismatches.Add($mm) }
     }
     $action="No action";$actionResult="Dry run"
     if($user -and $eligible -and (Test-IsADUserObject $user)){
@@ -934,7 +1252,7 @@ foreach($r in $hrRows){
     if($user){
         if(-not $eligible){$actionResult="Skipped"}
         elseif((Normalize-Text (Get-ObjectValue $user "employeeID")) -eq (Normalize-Text $emp)){$actionResult="Already correct";$notes="$notes EmployeeID already matches."}
-        elseif($Apply){ $userDn=Get-ObjectValue $user "DistinguishedName"; if($PSCmdlet.ShouldProcess($userDn,"Set employeeID to $emp")){ Set-ADUser -Identity $userDn -EmployeeID $emp; $action="Update employeeID";$actionResult="Updated" } }
+        elseif($Apply){ $userDn=Get-ObjectValue $user "DistinguishedName"; if($PSCmdlet.ShouldProcess($userDn,"Set employeeID to $emp")){ Set-ADUser -Identity $userDn -EmployeeID $emp; Clear-DirectoryObjectCache; $action="Update employeeID";$actionResult="Updated" } }
         else{$action="Would update employeeID";$actionResult="Dry run only"}
     }
     if($user -and $eligible -and (Test-IsADUserObject $user)){
@@ -952,9 +1270,18 @@ foreach($r in $hrRows){
     $results.Add((New-Row $r $user $status $by $eligible $action $actionResult $notes $rowNum))
 }
 Write-Progress -Activity $matchingProgressActivity -Completed
+Write-Phase "Finished $matchingProgressActivity."
 
+Write-Phase "Building EmployeeID apply, duplicate, and MailContact review result sets."
 $employeeIdApplyResults=if($Apply){@(New-EmployeeIdApplyReportRows -MatchResults $results)}else{@()}
 $duplicateAdUserMatches=@($results|Where-Object{$_.MatchStatus -eq "Duplicate - AD User Already Matched"})
+$mailContactReviewResults=@(New-MailContactReviewRows -MatchResults $results -SearchBase $SearchBase -CheckMatchedADUsersForMailContacts:$CheckMailContactReview)
+$mailContactDeleteResults=if($DeleteApprovedMailContacts -and $Apply){@(New-MailContactDeleteReportRows -HrRows $hrRows -SearchBase $SearchBase -DuplicateApprovedDns $duplicateApprovedDns)}else{@()}
+if($CheckMailContactReview){
+    Write-Phase "Finished building result sets. MailContact review rows: $($mailContactReviewResults.Count)."
+}else{
+    Write-Phase "Finished building result sets. MailContact review rows: $($mailContactReviewResults.Count). Extra matched-AD-user MailContact lookup skipped; use -CheckMailContactReview to enable it."
+}
 $dir=Split-Path $ReportPath -Parent; if($dir -and -not(Test-Path $dir)){New-Item -Path $dir -ItemType Directory -Force | Out-Null}
 if($CheckSystemMismatch -and [string]::IsNullOrWhiteSpace($SystemMismatchReportPath)){
     $reportDirectory=Split-Path $ReportPath -Parent
@@ -968,16 +1295,27 @@ if($CheckSystemMismatch){
     $mismatchDir=Split-Path $SystemMismatchReportPath -Parent
     if($mismatchDir -and -not(Test-Path $mismatchDir)){New-Item -Path $mismatchDir -ItemType Directory -Force | Out-Null}
 }
+Write-Phase "Preparing report export."
 $xlsx=Ensure-ImportExcelModule -DoNotInstallMissingModules:$DoNotInstallMissingModules
 if($xlsx){
+    Write-Phase "Writing Excel report workbook."
     $employeeIdTextColumns=@("HR_$CsvEmployeeIdColumn","HR_WorkerID",$CsvEmployeeIdColumn,"AD_EmployeeID_Current","EmployeeIDBefore","EmployeeIDAfter","User_EmployeeID","HR_$CsvManagerReferenceColumn","HR_ManagerReference",$CsvManagerReferenceColumn)|Select-Object -Unique
+    if(Test-Path $ReportPath){Remove-Item -LiteralPath $ReportPath -Force}
+    if($CheckSystemMismatch -and -not [string]::IsNullOrWhiteSpace($SystemMismatchReportPath) -and (Test-Path $SystemMismatchReportPath)){Remove-Item -LiteralPath $SystemMismatchReportPath -Force}
     $results | Export-ReportWorksheet -Path $ReportPath -WorksheetName "HR AD Match" -TableName "HRADMatch" -NoNumberConversionColumns $employeeIdTextColumns
     if($duplicateAdUserMatches.Count -gt 0){
         $duplicateAdUserMatches | Export-ReportWorksheet -Path $ReportPath -WorksheetName "Duplicate AD User Matches" -TableName "DuplicateADUserMatches" -NoNumberConversionColumns $employeeIdTextColumns
         Write-Host "Duplicate AD user matches worksheet added to readiness report: $ReportPath" -ForegroundColor Green
     }
+    if($mailContactReviewResults.Count -gt 0){
+        $mailContactReviewResults | Export-ReportWorksheet -Path $ReportPath -WorksheetName "MailContact Review" -TableName "MailContactReview" -NoNumberConversionColumns $employeeIdTextColumns
+        Write-Host "MailContact review worksheet added to readiness report: $ReportPath" -ForegroundColor Green
+    }
     if($Apply){
         $employeeIdApplyResults | Export-ReportWorksheet -Path $ReportPath -WorksheetName "EmployeeID Apply Results" -TableName "EmployeeIDApplyResults" -NoNumberConversionColumns $employeeIdTextColumns
+    }
+    if($DeleteApprovedMailContacts -and $Apply){
+        $mailContactDeleteResults | Export-ReportWorksheet -Path $ReportPath -WorksheetName "MailContact Delete Results" -TableName "MailContactDeleteResults" -NoNumberConversionColumns $employeeIdTextColumns
     }
     Write-Host "Excel report written to: $ReportPath" -ForegroundColor Green
     if($CheckSystemMismatch){
@@ -989,16 +1327,27 @@ if($xlsx){
         Write-Host "System mismatch report written to: $SystemMismatchReportPath" -ForegroundColor Green
     }
 }else{
+    Write-Phase "Writing CSV fallback reports."
     $csv=[System.IO.Path]::ChangeExtension($ReportPath,".csv"); $results|Export-Csv $csv -NoTypeInformation -Encoding UTF8; Write-Warning "CSV report written to: $csv"
     if($duplicateAdUserMatches.Count -gt 0){
         $duplicateCsv=[System.IO.Path]::ChangeExtension($ReportPath,".Duplicate-AD-User-Matches.csv")
         $duplicateAdUserMatches|Export-Csv $duplicateCsv -NoTypeInformation -Encoding UTF8
         Write-Warning "Duplicate AD user matches CSV report written to: $duplicateCsv"
     }
+    if($mailContactReviewResults.Count -gt 0){
+        $mailContactReviewCsv=[System.IO.Path]::ChangeExtension($ReportPath,".MailContact-Review.csv")
+        $mailContactReviewResults|Export-Csv $mailContactReviewCsv -NoTypeInformation -Encoding UTF8
+        Write-Warning "MailContact review CSV report written to: $mailContactReviewCsv"
+    }
     if($Apply){
         $applyCsv=[System.IO.Path]::ChangeExtension($ReportPath,".EmployeeID-Apply-Results.csv")
         $employeeIdApplyResults|Export-Csv $applyCsv -NoTypeInformation -Encoding UTF8
         Write-Warning "EmployeeID apply results CSV report written to: $applyCsv"
+    }
+    if($DeleteApprovedMailContacts -and $Apply){
+        $mailContactDeleteCsv=[System.IO.Path]::ChangeExtension($ReportPath,".MailContact-Delete-Results.csv")
+        $mailContactDeleteResults|Export-Csv $mailContactDeleteCsv -NoTypeInformation -Encoding UTF8
+        Write-Warning "MailContact delete results CSV report written to: $mailContactDeleteCsv"
     }
     if($CheckSystemMismatch){
         $mismatchCsv=[System.IO.Path]::ChangeExtension($SystemMismatchReportPath,".csv")
@@ -1006,11 +1355,12 @@ if($xlsx){
         Write-Warning "System mismatch CSV report written to: $mismatchCsv"
     }
 }
+Write-Phase "Finished report export."
 
 Write-Host "`nSummary:" -ForegroundColor Cyan
 $results|Group-Object MatchStatus|Select-Object Name,Count|Format-Table -AutoSize
 $acceptedReviewDecisions=@((Normalize-Text $ApprovedReviewDecision),(Normalize-Text $IgnoredReviewDecision))
-$unapprovedResults=@($results|Where-Object{($acceptedReviewDecisions -notcontains (Normalize-Text $_.ReviewDecision)) -or ($_.MatchStatus -like "ReviewDecision Invalid*")})
+$unapprovedResults=@($results|Where-Object{(($_.MatchStatus -ne "Matched - By WorkerID") -and ($_.ActionResult -ne "Already correct") -and ($acceptedReviewDecisions -notcontains (Normalize-Text $_.ReviewDecision))) -or ($_.MatchStatus -like "ReviewDecision Invalid*")})
 Write-Host "`nUnapproved / still requiring review:" -ForegroundColor Cyan
 if($unapprovedResults.Count -gt 0){
     $unapprovedResults|Group-Object MatchStatus|Select-Object Name,Count|Format-Table -AutoSize
@@ -1018,11 +1368,25 @@ if($unapprovedResults.Count -gt 0){
     Write-Host "No unapproved rows remain." -ForegroundColor Green
 }
 if($CheckSystemMismatch){
-    Write-Host "`nSystem mismatch match source:" -ForegroundColor Cyan
-    if($systemMismatchMatchSources.Count -gt 0){
-        $systemMismatchMatchSources|Group-Object EmployeeIDActionGuidance|Select-Object Name,Count|Format-Table -AutoSize
+    Write-Host "`nSystem mismatch summary:" -ForegroundColor Cyan
+    if($systemMismatchComparisonResults.Count -gt 0){
+        $systemMismatchComparisonResults|Group-Object SystemMismatchStatus|Select-Object Name,Count|Format-Table -AutoSize
     }else{
         Write-Host "No matched AD users were available for system mismatch comparison." -ForegroundColor Yellow
     }
 }
-if(-not $Apply){Write-Host "Dry run complete. No AD changes were made." -ForegroundColor Yellow}else{Write-Host "Apply mode complete. Only employeeID updates were attempted against eligible AD users." -ForegroundColor Green}
+if($mailContactReviewResults.Count -gt 0){
+    Write-Host "`nMailContact review summary:" -ForegroundColor Cyan
+    $mailContactReviewResults|Group-Object MailContactReviewStatus|Select-Object Name,Count|Format-Table -AutoSize
+}
+if($DeleteApprovedMailContacts -and $Apply){
+    Write-Host "`nMailContact deletion summary:" -ForegroundColor Cyan
+    $mailContactDeleteResults|Group-Object ActionResult|Select-Object Name,Count|Format-Table -AutoSize
+}
+if(-not $Apply){
+    Write-Host "Dry run complete. No AD changes were made." -ForegroundColor Yellow
+}elseif($DeleteApprovedMailContacts){
+    Write-Host "Apply mode complete. EmployeeID updates were attempted against eligible AD users, and approved MailContact deletions were attempted only after object type confirmation." -ForegroundColor Green
+}else{
+    Write-Host "Apply mode complete. Only employeeID updates were attempted against eligible AD users." -ForegroundColor Green
+}
