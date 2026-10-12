@@ -55,7 +55,7 @@ For last-name matching and mismatch checks, `PreferredLastName` is used when pop
 | Switch | Type | Default | Explanation |
 |---|---|---|---|
 | `-Apply` | `[switch]` | Off | Writes eligible `employeeID` updates to matched AD Users and MailUsers. Without this switch, the script is a dry run. |
-| `-CheckSystemMismatch` | `[switch]` | Off | Creates a report-only comparison of selected HR columns against attributes on the matched AD object. |
+| `-CheckSystemMismatch` | `[switch]` | Off | Creates a report-only comparison of selected HR columns, including email against `mail`, with attributes queried from live AD during this run. CSV `AD_*` columns are not used as the AD source. |
 | `-CheckMailContactReview` | `[switch]` | Off | Enables the slower extra MailContact lookup for rows that already matched an AD User or MailUser. |
 | `-ReserveExactMatches` | `[switch]` | Off | Enables the slower pre-reservation scan that stops exact AD matches elsewhere in the file appearing as potential matches on other rows. |
 | `-ApprovedOnly` | `[switch]` | Off | Processes only rows where `ReviewDecision` is `Approved`; resolves `ApprovedADDistinguishedName` directly and skips WorkerID, email, name, and MailContact matching. Writes still require `-Apply`. |
@@ -143,19 +143,22 @@ For performance on large HR exports, the default run skips the slower exact-matc
 
 `-CheckSystemMismatch` does not perform a separate user match. It compares the HR row against the AD object selected by the main match logic. Manual `ApprovedADDistinguishedName` decisions are used first, then WorkerID to AD `employeeID`, then email and name-based matching.
 
+The AD values come from `Get-ADObject` directory queries made during the current run, not from `AD_*` columns in the input CSV. Repeated identical queries can reuse an in-memory cache within that run, so the comparison uses the queried object without a separate refresh immediately before each attribute check.
+
 The current system mismatch comparison is deliberately limited to:
 
 - `PreferredFirstName` -> AD `givenName`
 - `PreferredLastName` fallback to `LastName` -> AD `sn`
+- `PrimaryWorkEmail` (or reviewed CSV `HR_PrimaryWorkEmail`) -> AD `mail`
 - `BusinessTitle` -> AD `title`
 - `Department` -> AD `department`
 - `ManagerReference` -> AD `manager`
 
-Email-style values are still used for matching, but they are excluded from the system mismatch report because mail attributes may only be managed during account creation.
+Email mismatch checks compare only AD `mail`, ignoring case and surrounding whitespace. An HR email that matches a proxy address, `targetAddress`, or UPN still reports a mismatch if it differs from `mail`. The default `-CsvEmailColumn PrimaryWorkEmail` already accepts `HR_PrimaryWorkEmail`; no override is needed for that reviewed CSV header. Email differences are report-only and do not cause email writes, including with `-Apply`. The email mapping remains labelled `Create only` rather than implying that provisioning will update existing-account email addresses.
 
 For manager mismatches, the HR `ManagerReference` value is treated as the manager's WorkerID. The script resolves it to a proposed AD manager DN by first looking for an AD user whose `employeeID` equals that WorkerID. If that is not available, it finds the manager's own HR row and resolves that row to AD by email, then by first name, last name, and title. If the manager reference cannot resolve to exactly one AD user, the mismatch report flags it as `Manager reference unresolved` rather than guessing.
 
-The mismatch report includes the HR first name, last name, business title, department, and manager reference; the selected AD user's UPN, current AD `employeeID`, given name, surname, job title, department, and manager DN; the current AD value; the proposed HR or resolved DN value; and a `WhatWillChange` summary for each differing attribute.
+The mismatch report includes the HR email (`HR_PrimaryWorkEmail`), first name, last name, business title, department, and manager reference; the selected AD user's email (`AD_Mail`), UPN, current AD `employeeID`, given name, surname, job title, department, and manager DN; the current AD value; the proposed HR or resolved DN value; and a `WhatWillChange` summary for each differing attribute.
 
 When `-CheckSystemMismatch` is used, the console output includes a compact `System mismatch summary` that counts matched users with HR/AD attribute mismatches and matched users with no HR/AD attribute mismatches. The system mismatch check is report-only and only compares HR columns against AD attributes on the AD object selected by the main match logic.
 

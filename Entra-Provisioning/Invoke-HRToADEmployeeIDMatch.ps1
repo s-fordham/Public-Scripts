@@ -5,6 +5,8 @@
 .DESCRIPTION
     Default mode is dry-run. AD users are preferred. If no AD user is matched, MailContacts and MailUsers are checked and reported only.
     Write actions require -Apply. By default, the only write action is Set-ADUser -EmployeeID. Approved MailContacts can also be deleted when -DeleteApprovedMailContacts is supplied.
+    -CheckSystemMismatch compares HR values with the selected object queried from live AD during this run, not AD columns in the CSV.
+    Directory queries can reuse cached results within the same run. PrimaryWorkEmail (or HR_PrimaryWorkEmail) is compared with AD mail only; email differences are report-only.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -648,10 +650,11 @@ function New-MismatchRows {
         }
         if(-not $isMatch){
             $mismatchType=if($m.CompareMode -eq "ManagerReferenceToDN" -and $managerResolution -and -not $managerResolution.Resolved){"Manager reference unresolved"}else{"Value differs"}
-            $whatWillChange=if($m.CompareMode -eq "ManagerReferenceToDN" -and $managerResolution -and -not $managerResolution.Resolved){"ManagerReference '$hr' could not be resolved to exactly one AD manager DN. Review before provisioning updates AD manager."}else{"AD $($m.ADAttribute) would change from '$ad' to '$proposed'."}
+            $whatWillChange=if($m.CompareMode -eq "ManagerReferenceToDN" -and $managerResolution -and -not $managerResolution.Resolved){"ManagerReference '$hr' could not be resolved to exactly one AD manager DN. Review before provisioning updates AD manager."}elseif($m.MappingType -eq "Create only"){"HR value '$proposed' differs from AD $($m.ADAttribute) '$ad'. Report-only; this script does not update this attribute."}else{"AD $($m.ADAttribute) would change from '$ad' to '$proposed'."}
             $rows.Add([pscustomobject]@{
                 CsvRow=$CsvRow
                 HR_WorkerID=(Get-CsvValue $HrRow $CsvEmployeeIdColumn)
+                HR_PrimaryWorkEmail=(Get-CsvValue $HrRow $CsvEmailColumn)
                 HR_FirstName=(Get-CsvValue $HrRow $CsvFirstNameColumn)
                 HR_LastName=(Get-HrLastNameValue $HrRow)
                 HR_LastNameSource=(Get-HrLastNameSource $HrRow)
@@ -659,6 +662,7 @@ function New-MismatchRows {
                 HR_Department=(Get-CsvValue $HrRow $CsvDepartmentColumn)
                 HR_ManagerReference=(Get-CsvValue $HrRow $CsvManagerReferenceColumn)
                 AD_UserPrincipalName=(Get-ObjectValue $User "userPrincipalName")
+                AD_Mail=(Get-ObjectValue $User "mail")
                 AD_EmployeeID_Current=(Get-ObjectValue $User "employeeID")
                 AD_SamAccountName=(Get-ObjectValue $User "sAMAccountName")
                 AD_GivenName=(Get-ObjectValue $User "givenName")
@@ -677,7 +681,7 @@ function New-MismatchRows {
                 ProposedHRValue=$proposed
                 WhatWillChange=$whatWillChange
                 MismatchType=$mismatchType
-                ProvisioningImpact="Potential AD change when Entra Workday provisioning updates this attribute."
+                ProvisioningImpact=if($m.MappingType -eq "Create only"){"Create-only mapping; difference reported for review, not an existing-account provisioning update."}else{"Potential AD change when Entra Workday provisioning updates this attribute."}
             })
         }
     }
@@ -688,6 +692,7 @@ function New-EmptyMismatchReportRow {
     [pscustomobject]@{
         CsvRow=$null
         HR_WorkerID=$null
+        HR_PrimaryWorkEmail=$null
         HR_FirstName=$null
         HR_LastName=$null
         HR_LastNameSource=$null
@@ -695,6 +700,7 @@ function New-EmptyMismatchReportRow {
         HR_Department=$null
         HR_ManagerReference=$null
         AD_UserPrincipalName=$null
+        AD_Mail=$null
         AD_EmployeeID_Current=$null
         AD_SamAccountName=$null
         AD_GivenName=$null
@@ -1058,7 +1064,7 @@ Write-Phase "Indexed HR rows. Duplicate approved DNs found: $($duplicateApproved
 $map=@(
     [pscustomobject]@{WorkdayAttribute="FirstName";CsvColumn=$CsvFirstNameColumn;ADAttribute="givenName";MappingType="Create + update";CompareMode="Direct";Compare=$true},
     [pscustomobject]@{WorkdayAttribute="PreferredLastName";CsvColumn=$CsvLastNameColumn;ADAttribute="sn";MappingType="Create + update";CompareMode="Direct";Compare=$true},
-    [pscustomobject]@{WorkdayAttribute="PrimaryWorkEmail";CsvColumn=$CsvEmailColumn;ADAttribute="mail/proxyAddresses/targetAddress";MappingType="Create only";CompareMode="Email";Compare=$false},
+    [pscustomobject]@{WorkdayAttribute="PrimaryWorkEmail";CsvColumn=$CsvEmailColumn;ADAttribute="mail";MappingType="Create only";CompareMode="Direct";Compare=$true},
     [pscustomobject]@{WorkdayAttribute="HR Business Title";CsvColumn=$CsvJobTitleColumn;ADAttribute="title";MappingType="Create + update";CompareMode="Direct";Compare=$true},
     [pscustomobject]@{WorkdayAttribute="Department";CsvColumn=$CsvDepartmentColumn;ADAttribute="department";MappingType="Create + update";CompareMode="Direct";Compare=$true},
     [pscustomobject]@{WorkdayAttribute="ManagerReference";CsvColumn=$CsvManagerReferenceColumn;ADAttribute="manager";MappingType="Create + update";CompareMode="ManagerReferenceToDN";Compare=$true},
