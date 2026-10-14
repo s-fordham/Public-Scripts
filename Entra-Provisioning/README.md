@@ -44,6 +44,11 @@ The script defaults are aligned to the current Workday export column names:
 [string]$CsvDepartmentColumn = "Department"
 [string]$CsvManagerReferenceColumn = "ManagerReference"
 [string]$CsvManagerEmailColumn = "PrimaryWorkEmail_Manager"
+[string]$CsvCompanyColumn = "Company"
+[string]$CsvStreetAddressColumn = "AddressLineData2"
+[string]$CsvOfficeColumn = "AddressLineData"
+[string]$CsvCityColumn = "Work Address - City"
+[string]$CsvPostalCodeColumn = "PostalCode"
 ```
 
 These can be overridden at runtime if the HR export uses different column names.
@@ -151,8 +156,15 @@ The current system mismatch comparison is deliberately limited to:
 - `PreferredLastName` fallback to `LastName` -> AD `sn`
 - `PrimaryWorkEmail` (or reviewed CSV `HR_PrimaryWorkEmail`) -> AD `mail`
 - `BusinessTitle` -> AD `title`
+- `Company` -> AD `company`
+- `AddressLineData2` -> AD `streetAddress`
+- `AddressLineData` -> AD `physicalDeliveryOfficeName`
+- `Work Address - City` -> AD `l`
+- `PostalCode` -> AD `postalCode`
 - `Department` -> AD `department`
 - `ManagerReference` -> AD `manager`
+
+Company and address checks also accept the corresponding `HR_` headers in a reviewed CSV, such as `HR_Company` and `HR_Work Address - City`. They use the existing text comparison rules: case is ignored, surrounding whitespace is trimmed, and repeated whitespace is collapsed. A missing HR column is skipped; a present but blank HR value is compared with AD and can be reported as a mismatch. Each difference shows the source column, AD attribute, `CurrentADValue`, and `ProposedHRValue`. These checks remain report-only, including with `-Apply`; they do not write company or address attributes to AD.
 
 Email mismatch checks compare only AD `mail`, ignoring case and surrounding whitespace. An HR email that matches a proxy address, `targetAddress`, or UPN still reports a mismatch if it differs from `mail`. The default `-CsvEmailColumn PrimaryWorkEmail` already accepts `HR_PrimaryWorkEmail`; no override is needed for that reviewed CSV header. Email differences are report-only and do not cause email writes, including with `-Apply`. The email mapping remains labelled `Create only` rather than implying that provisioning will update existing-account email addresses.
 
